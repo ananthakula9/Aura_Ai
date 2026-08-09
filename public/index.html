@@ -1,1 +1,865 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Aura AI — by Aashrith</title>
+<style>
+  :root {
+    --bg: #212121;
+    --bg-sidebar: #171717;
+    --bg-elevated: #2a2a2a;
+    --bg-input: #2f2f2f;
+    --border: #3a3a3a;
+    --accent: #8b5cf6;
+    --accent-dim: #7c5ce0;
+    --text: #ececec;
+    --text-dim: #a3a3a3;
+    --text-faint: #6e6e6e;
+    --gain: #4ade80;
+    --loss: #f87171;
+    --gold: #d4a94f;
+  }
 
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    height: 100vh;
+    overflow: hidden;
+  }
+
+  .app { display: flex; height: 100vh; }
+
+  .sidebar {
+    width: 240px;
+    background: var(--bg-sidebar);
+    display: flex;
+    flex-direction: column;
+    flex-shrink: 0;
+    border-right: 1px solid var(--border);
+    transition: margin-left 0.2s ease;
+  }
+  .sidebar.collapsed { margin-left: -240px; }
+
+  .sidebar-header { padding: 12px; }
+
+  .new-chat-btn {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 12px;
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 10px;
+    cursor: pointer;
+    font-size: 13.5px;
+    font-weight: 500;
+    transition: background 0.15s;
+  }
+  .new-chat-btn:hover { background: var(--bg-elevated); }
+
+  .sidebar-body { flex: 1; overflow-y: auto; padding: 8px 12px; }
+
+  .sidebar-section-label {
+    font-size: 11px;
+    color: var(--text-faint);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    padding: 8px 6px 6px;
+    font-weight: 600;
+  }
+
+  .sidebar-item {
+    padding: 8px 10px;
+    border-radius: 8px;
+    font-size: 13.5px;
+    color: var(--text-dim);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .sidebar-item.current { background: var(--bg-elevated); color: var(--text); }
+
+  .sidebar-footer { padding: 12px; border-top: 1px solid var(--border); }
+
+  .settings-link {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    color: var(--text-dim);
+    font-size: 13.5px;
+    cursor: pointer;
+    background: none;
+    border: none;
+    width: 100%;
+    text-align: left;
+  }
+  .settings-link:hover { background: var(--bg-elevated); color: var(--text); }
+
+  .main {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    position: relative;
+  }
+
+  .top-bar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 16px;
+    flex-shrink: 0;
+  }
+  .top-left { display: flex; align-items: center; gap: 10px; }
+
+  .menu-toggle {
+    display: none;
+    background: none;
+    border: none;
+    color: var(--text-dim);
+    font-size: 18px;
+    cursor: pointer;
+    padding: 4px;
+  }
+
+  .model-pill {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text);
+    padding: 6px 10px;
+    border-radius: 8px;
+    cursor: pointer;
+  }
+  .model-pill:hover { background: var(--bg-elevated); }
+  .model-pill .caret { font-size: 10px; color: var(--text-faint); }
+
+  .top-right { display: flex; align-items: center; gap: 4px; }
+
+  .icon-btn {
+    background: none;
+    border: none;
+    color: var(--text-dim);
+    width: 34px; height: 34px;
+    border-radius: 8px;
+    cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 15px;
+    transition: background 0.15s;
+  }
+  .icon-btn:hover { background: var(--bg-elevated); color: var(--text); }
+
+  .conversation {
+    flex: 1;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+
+  .conversation-inner {
+    width: 100%;
+    max-width: 700px;
+    padding: 24px 20px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 22px;
+    flex: 1;
+  }
+
+  .empty-state {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    gap: 6px;
+    padding-bottom: 60px;
+  }
+  .empty-state .glyph {
+    width: 44px; height: 44px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, var(--accent-dim), var(--accent));
+    display: flex; align-items: center; justify-content: center;
+    font-weight: 700;
+    font-size: 17px;
+    color: white;
+    margin-bottom: 14px;
+  }
+  .empty-state h1 { font-size: 24px; font-weight: 600; color: var(--text); }
+  .empty-state p { font-size: 14px; color: var(--text-faint); margin-top: 4px; }
+
+  .msg { display: flex; gap: 12px; max-width: 100%; }
+  .msg.user { align-self: flex-end; flex-direction: row-reverse; max-width: 80%; }
+  .msg.ai { align-self: flex-start; width: 100%; }
+
+  .avatar {
+    width: 28px; height: 28px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 12px;
+    font-weight: 700;
+    margin-top: 2px;
+  }
+  .msg.ai .avatar { background: linear-gradient(135deg, var(--accent-dim), var(--accent)); color: white; }
+  .msg.user .avatar { background: var(--bg-elevated); color: var(--text-dim); }
+
+  .bubble {
+    font-size: 15px;
+    line-height: 1.65;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+  }
+  .msg.user .bubble { background: var(--bg-elevated); padding: 10px 14px; border-radius: 16px; }
+  .msg.ai .bubble { padding-top: 3px; }
+
+  .aura-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 11px;
+    font-weight: 600;
+    margin-top: 6px;
+    padding: 2px 8px;
+    border-radius: 10px;
+    opacity: 0.85;
+  }
+  .aura-tag.gain { color: var(--gain); background: rgba(74, 222, 128, 0.08); }
+  .aura-tag.loss { color: var(--loss); background: rgba(248, 113, 113, 0.08); }
+
+  .debug-box {
+    margin-top: 8px;
+    padding: 8px 10px;
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    font-size: 11px;
+    font-family: 'SF Mono', Consolas, monospace;
+    color: var(--text-faint);
+    line-height: 1.7;
+  }
+  .debug-box b { color: var(--text-dim); }
+
+  .loading-dots { display: flex; gap: 4px; padding: 6px 0; }
+  .loading-dots span { width: 6px; height: 6px; border-radius: 50%; background: var(--text-faint); animation: bounce 1.3s infinite; }
+  .loading-dots span:nth-child(2) { animation-delay: 0.15s; }
+  .loading-dots span:nth-child(3) { animation-delay: 0.3s; }
+  @keyframes bounce { 0%,80%,100%{opacity:0.3} 40%{opacity:1} }
+
+  .input-area { padding: 10px 20px 20px; display: flex; justify-content: center; flex-shrink: 0; }
+
+  .input-shell {
+    width: 100%;
+    max-width: 700px;
+    background: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: 26px;
+    display: flex;
+    align-items: flex-end;
+    padding: 8px 8px 8px 18px;
+    gap: 8px;
+  }
+
+  .input-shell textarea {
+    flex: 1;
+    background: none;
+    border: none;
+    color: var(--text);
+    font-size: 15px;
+    font-family: inherit;
+    resize: none;
+    max-height: 160px;
+    padding: 8px 0;
+    line-height: 1.4;
+  }
+  .input-shell textarea:focus { outline: none; }
+  .input-shell textarea::placeholder { color: var(--text-faint); }
+
+  .send-btn {
+    background: var(--text);
+    border: none;
+    color: var(--bg);
+    width: 34px; height: 34px;
+    border-radius: 50%;
+    cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 15px;
+    flex-shrink: 0;
+    transition: opacity 0.15s;
+  }
+  .send-btn:disabled { opacity: 0.3; cursor: not-allowed; }
+
+  .disclaimer { text-align: center; font-size: 11px; color: var(--text-faint); padding-bottom: 4px; }
+
+  ::-webkit-scrollbar { width: 8px; }
+  ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+  .modal-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.5);
+    z-index: 50;
+    align-items: center;
+    justify-content: center;
+    padding: 20px;
+  }
+  .modal-overlay.open { display: flex; }
+
+  .modal {
+    background: var(--bg-elevated);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    width: 100%;
+    max-width: 480px;
+    max-height: 85vh;
+    overflow-y: auto;
+    box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+  }
+
+  .modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+    background: var(--bg-elevated);
+  }
+  .modal-header h2 { font-size: 16px; font-weight: 600; }
+
+  .modal-tabs { display: flex; gap: 4px; padding: 10px 16px 0; border-bottom: 1px solid var(--border); }
+  .modal-tab { padding: 8px 14px; font-size: 13px; font-weight: 500; color: var(--text-faint); cursor: pointer; border-bottom: 2px solid transparent; }
+  .modal-tab.active { color: var(--text); border-bottom-color: var(--accent); }
+
+  .modal-body { padding: 18px 20px; }
+  .modal-panel { display: none; flex-direction: column; gap: 18px; }
+  .modal-panel.active { display: flex; }
+
+  .field-group label { display: block; font-size: 13px; font-weight: 500; color: var(--text); margin-bottom: 6px; }
+  .field-hint { font-size: 11.5px; color: var(--text-faint); margin-top: 5px; line-height: 1.5; }
+  .field-hint a { color: var(--accent); }
+
+  input[type="password"], input[type="text"].text-field {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    padding: 9px 12px;
+    border-radius: 8px;
+    font-size: 13.5px;
+  }
+  input[type="password"]:focus, input[type="text"].text-field:focus { outline: none; border-color: var(--accent-dim); }
+
+  .row-between { display: flex; align-items: center; justify-content: space-between; }
+  .row-between label { margin-bottom: 0; font-size: 13.5px; font-weight: 500; }
+  .row-sub { font-size: 11.5px; color: var(--text-faint); margin-top: 2px; }
+
+  .mode-select { display: flex; flex-wrap: wrap; gap: 6px; }
+  .mode-opt {
+    padding: 6px 12px;
+    border-radius: 16px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text-dim);
+    font-size: 12px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .mode-opt.active { background: var(--accent-dim); border-color: var(--accent); color: white; }
+
+  input[type="range"] { width: 100%; accent-color: var(--accent); }
+
+  .toggle { position: relative; width: 40px; height: 22px; flex-shrink: 0; }
+  .toggle input { opacity: 0; width: 0; height: 0; }
+  .toggle-track { position: absolute; inset: 0; background: var(--border); border-radius: 22px; cursor: pointer; transition: background 0.15s; }
+  .toggle-track::before { content: ''; position: absolute; width: 16px; height: 16px; left: 3px; top: 3px; background: white; border-radius: 50%; transition: transform 0.15s; }
+  .toggle input:checked + .toggle-track { background: var(--accent-dim); }
+  .toggle input:checked + .toggle-track::before { transform: translateX(18px); }
+
+  .aura-meter-track { height: 6px; background: var(--bg); border-radius: 4px; overflow: hidden; margin-top: 6px; border: 1px solid var(--border); }
+  .aura-meter-fill { height: 100%; background: linear-gradient(90deg, var(--accent-dim), var(--accent)); transition: width 0.5s ease; }
+
+  .danger-btn { background: none; border: 1px solid var(--border); color: var(--loss); padding: 8px 14px; border-radius: 8px; font-size: 13px; cursor: pointer; }
+  .danger-btn:hover { background: rgba(248, 113, 113, 0.08); }
+
+  @media (max-width: 720px) {
+    .sidebar { position: fixed; z-index: 40; height: 100vh; }
+    .sidebar:not(.collapsed) { margin-left: 0; }
+    .sidebar.collapsed { margin-left: -240px; }
+    .menu-toggle { display: flex; align-items: center; justify-content: center; }
+  }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <div class="sidebar collapsed" id="sidebar">
+    <div class="sidebar-header">
+      <button class="new-chat-btn" id="newChatBtn">+ New chat</button>
+    </div>
+    <div class="sidebar-body">
+      <div class="sidebar-section-label">Today</div>
+      <div class="sidebar-item current">Current conversation</div>
+    </div>
+    <div class="sidebar-footer">
+      <button class="settings-link" id="settingsBtnSidebar">⚙ &nbsp;Settings</button>
+    </div>
+  </div>
+
+  <div class="main">
+    <div class="top-bar">
+      <div class="top-left">
+        <button class="menu-toggle" id="menuToggle">☰</button>
+        <div class="model-pill" id="modelPill">Aura AI <span class="caret">▾</span></div>
+      </div>
+      <div class="top-right">
+        <button class="icon-btn" id="settingsBtnTop" title="Settings">⚙</button>
+      </div>
+    </div>
+
+    <div class="conversation" id="conversation">
+      <div class="conversation-inner" id="conversationInner">
+        <div class="empty-state" id="emptyState">
+          <div class="glyph">A</div>
+          <h1>How can I help you today?</h1>
+          <p>Ask anything — I can explain, solve, write, code, or just talk.</p>
+          <p style="font-size:11px; color:var(--text-faint); margin-top:14px;">Made by Aashrith</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="input-area">
+      <div style="width:100%; max-width:700px; display:flex; flex-direction:column; gap:6px;">
+        <div class="input-shell">
+          <textarea id="userInput" placeholder="Message Aura AI..." rows="1"></textarea>
+          <button class="send-btn" id="sendBtn">➤</button>
+        </div>
+        <div class="disclaimer">Aura AI can make mistakes. Check important info.</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="modalOverlay">
+  <div class="modal">
+    <div class="modal-header">
+      <h2>Settings</h2>
+      <button class="icon-btn" id="closeModalBtn">✕</button>
+    </div>
+    <div class="modal-tabs">
+      <div class="modal-tab active" data-tab="general">General</div>
+      <div class="modal-tab" data-tab="personality">Personality</div>
+      <div class="modal-tab" data-tab="developer">Developer</div>
+    </div>
+    <div class="modal-body">
+
+      <div class="modal-panel active" id="tab-general">
+        <div class="field-group">
+          <label>Server connection</label>
+          <div class="row-sub" id="serverStatus">Checking...</div>
+          <div class="field-hint">The Gemini API key lives on the server, not in your browser — nothing to paste here.</div>
+        </div>
+        <div class="field-group">
+          <label>Model</label>
+          <input type="text" class="text-field" id="modelInput" value="gemini-2.5-flash">
+          <div class="field-hint">Any Gemini model ID (e.g. gemini-2.5-flash, gemini-2.5-pro). Default is fast and cost-efficient; -pro variants reason better on harder tasks.</div>
+        </div>
+        <div class="row-between">
+          <div>
+            <label>Clear conversation</label>
+            <div class="row-sub">Also resets aura score and memory</div>
+          </div>
+          <button class="danger-btn" id="clearBtn">Clear</button>
+        </div>
+      </div>
+
+      <div class="modal-panel" id="tab-personality">
+        <div class="field-group">
+          <label>Aura score</label>
+          <div class="aura-meter-track"><div class="aura-meter-fill" id="meterFill" style="width:50%"></div></div>
+          <div class="row-sub" style="margin-top:4px;">Current: <b id="meterScore" style="color:var(--text);">500</b> / 1000 — reflects how well-timed vs. forced recent responses have been.</div>
+        </div>
+        <div class="field-group">
+          <label>Aura mode</label>
+          <div class="mode-select" id="modeBar">
+            <div class="mode-opt active" data-mode="AUTO">Auto</div>
+            <div class="mode-opt" data-mode="NORMAL">Normal</div>
+            <div class="mode-opt" data-mode="AURA">Aura</div>
+            <div class="mode-opt" data-mode="FARM">Farm</div>
+            <div class="mode-opt" data-mode="MAX_AURA">Max Aura</div>
+            <div class="mode-opt" data-mode="NO_AURA">No Aura</div>
+          </div>
+          <div class="field-hint">Auto lets the engine decide per message based on context. Substantive questions (math, code, explanations) always stay low-key regardless of mode.</div>
+        </div>
+        <div class="field-group">
+          <label>Gen Z language override</label>
+          <input type="range" id="slangSlider" min="-1" max="4" value="-1">
+          <div class="row-sub" id="slangVal">Auto (engine decides per message)</div>
+        </div>
+        <div class="row-between">
+          <div>
+            <label>Show aura events</label>
+            <div class="row-sub">Small +/- tags under messages when something notable happens</div>
+          </div>
+          <label class="toggle"><input type="checkbox" id="eventsToggle" checked><span class="toggle-track"></span></label>
+        </div>
+      </div>
+
+      <div class="modal-panel" id="tab-developer">
+        <div class="row-between">
+          <div>
+            <label>Debug info</label>
+            <div class="row-sub">Shows the Aura Engine's internal decision under each response</div>
+          </div>
+          <label class="toggle"><input type="checkbox" id="debugToggle"><span class="toggle-track"></span></label>
+        </div>
+        <div class="field-hint">Off by default. This is a developer/testing view — not part of the normal chat experience.</div>
+      </div>
+
+    </div>
+    <div style="text-align:center; padding:12px 20px; border-top:1px solid var(--border); font-size:11px; color:var(--text-faint);">
+      Aura AI — made by Aashrith
+    </div>
+  </div>
+</div>
+
+<script type="module">
+import {
+  AuraMemory, detectMood, runAuraEngine, runCringeCheck,
+  scoreAndEvent, STYLE_GUIDANCE, slangGuidance
+} from './pipeline.js';
+
+const memory = new AuraMemory();
+let currentMode = "AUTO";
+let debugMode = false;
+let eventsEnabled = true;
+let manualSlangOverride = -1;
+
+const conversationInner = document.getElementById('conversationInner');
+const emptyState = document.getElementById('emptyState');
+const conversation = document.getElementById('conversation');
+const userInput = document.getElementById('userInput');
+const sendBtn = document.getElementById('sendBtn');
+const meterFill = document.getElementById('meterFill');
+const meterScore = document.getElementById('meterScore');
+
+const modalOverlay = document.getElementById('modalOverlay');
+const closeModalBtn = document.getElementById('closeModalBtn');
+const modelInput = document.getElementById('modelInput');
+const serverStatus = document.getElementById('serverStatus');
+const slangSlider = document.getElementById('slangSlider');
+const slangVal = document.getElementById('slangVal');
+const debugToggle = document.getElementById('debugToggle');
+const eventsToggle = document.getElementById('eventsToggle');
+const clearBtn = document.getElementById('clearBtn');
+
+const sidebar = document.getElementById('sidebar');
+const menuToggle = document.getElementById('menuToggle');
+
+modelInput.value = localStorage.getItem('aura_model') || 'gemini-2.5-flash';
+modelInput.addEventListener('input', () => localStorage.setItem('aura_model', modelInput.value));
+
+// Health check — confirms the server has the Gemini key configured.
+async function checkServerHealth() {
+  try {
+    const res = await fetch('/api/health');
+    const data = await res.json();
+    if (data.keyConfigured) {
+      serverStatus.textContent = 'Connected — server key configured';
+      serverStatus.style.color = 'var(--gain)';
+    } else {
+      serverStatus.textContent = 'Server running, but GEMINI_API_KEY is not set';
+      serverStatus.style.color = 'var(--loss)';
+    }
+  } catch (e) {
+    serverStatus.textContent = 'Could not reach server';
+    serverStatus.style.color = 'var(--loss)';
+  }
+}
+checkServerHealth();
+
+function openModal() { modalOverlay.classList.add('open'); }
+function closeModal() { modalOverlay.classList.remove('open'); }
+document.getElementById('settingsBtnTop').addEventListener('click', openModal);
+document.getElementById('settingsBtnSidebar').addEventListener('click', openModal);
+document.getElementById('modelPill').addEventListener('click', openModal);
+closeModalBtn.addEventListener('click', closeModal);
+modalOverlay.addEventListener('click', (e) => { if (e.target === modalOverlay) closeModal(); });
+
+document.querySelectorAll('.modal-tab').forEach(tab => {
+  tab.addEventListener('click', () => {
+    document.querySelectorAll('.modal-tab').forEach(t => t.classList.remove('active'));
+    document.querySelectorAll('.modal-panel').forEach(p => p.classList.remove('active'));
+    tab.classList.add('active');
+    document.getElementById(`tab-${tab.dataset.tab}`).classList.add('active');
+  });
+});
+
+menuToggle.addEventListener('click', () => sidebar.classList.toggle('collapsed'));
+document.getElementById('newChatBtn').addEventListener('click', resetConversation);
+
+document.getElementById('modeBar').addEventListener('click', (e) => {
+  const opt = e.target.closest('.mode-opt');
+  if (!opt) return;
+  document.querySelectorAll('.mode-opt').forEach(c => c.classList.remove('active'));
+  opt.classList.add('active');
+  currentMode = opt.dataset.mode;
+});
+
+slangSlider.addEventListener('input', () => {
+  manualSlangOverride = parseInt(slangSlider.value);
+  slangVal.textContent = manualSlangOverride === -1
+    ? 'Auto (engine decides per message)'
+    : `Fixed at level ${manualSlangOverride}`;
+});
+
+debugToggle.addEventListener('change', () => { debugMode = debugToggle.checked; });
+eventsToggle.addEventListener('change', () => { eventsEnabled = eventsToggle.checked; });
+clearBtn.addEventListener('click', resetConversation);
+
+function resetConversation() {
+  conversationInner.innerHTML = '';
+  conversationInner.appendChild(emptyState);
+  Object.assign(memory, new AuraMemory());
+  chatHistory = [];
+  updateMeter();
+  closeModal();
+}
+
+updateMeter();
+function updateMeter() {
+  const pct = Math.max(0, Math.min(100, (memory.auraScore / 1000) * 100));
+  meterFill.style.width = pct + '%';
+  meterScore.textContent = memory.auraScore;
+}
+
+userInput.addEventListener('input', () => {
+  userInput.style.height = 'auto';
+  userInput.style.height = Math.min(userInput.scrollHeight, 160) + 'px';
+});
+
+function ensureConversationStarted() { if (emptyState.parentElement) emptyState.remove(); }
+
+function addUser(text) {
+  ensureConversationStarted();
+  const div = document.createElement('div');
+  div.className = 'msg user';
+  div.innerHTML = `<div class="avatar">You</div><div class="bubble"></div>`;
+  div.querySelector('.bubble').textContent = text;
+  conversationInner.appendChild(div);
+  scrollToBottom();
+}
+
+function addAI(text, debugInfo, auraEvent) {
+  ensureConversationStarted();
+  const div = document.createElement('div');
+  div.className = 'msg ai';
+  div.innerHTML = `<div class="avatar">A</div><div style="flex:1; min-width:0;"><div class="bubble"></div></div>`;
+  div.querySelector('.bubble').textContent = text;
+  const wrap = div.querySelector('div:last-child');
+
+  if (eventsEnabled && auraEvent) {
+    const tag = document.createElement('div');
+    tag.className = `aura-tag ${auraEvent.delta > 0 ? 'gain' : 'loss'}`;
+    const sign = auraEvent.delta > 0 ? '+' : '';
+    tag.textContent = `${auraEvent.type.toLowerCase()} ${sign}${auraEvent.delta}`;
+    wrap.appendChild(tag);
+  }
+
+  if (debugMode && debugInfo) {
+    const box = document.createElement('div');
+    box.className = 'debug-box';
+    box.innerHTML = debugInfo;
+    wrap.appendChild(box);
+  }
+
+  conversationInner.appendChild(div);
+  scrollToBottom();
+}
+
+function addLoading() {
+  ensureConversationStarted();
+  const div = document.createElement('div');
+  div.className = 'msg ai';
+  div.id = 'loadingMsg';
+  div.innerHTML = `<div class="avatar">A</div><div class="bubble"><div class="loading-dots"><span></span><span></span><span></span></div></div>`;
+  conversationInner.appendChild(div);
+  scrollToBottom();
+}
+function removeLoading() { const el = document.getElementById('loadingMsg'); if (el) el.remove(); }
+function scrollToBottom() { conversation.scrollTop = conversation.scrollHeight; }
+
+let chatHistory = [];
+
+async function callChatAPI(systemPrompt, userMessage) {
+  const model = modelInput.value.trim() || 'gemini-2.5-flash';
+
+  const messages = [
+    ...chatHistory.slice(-10),
+    { role: 'user', content: userMessage }
+  ];
+
+  // Calls our own backend, which forwards to Gemini — the key stays server-side.
+  const res = await fetch('/api/chat', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ systemPrompt, messages, model, maxTokens: 700, temperature: 0.9 })
+  });
+
+  const data = await res.json();
+
+  if (!res.ok) {
+    if (data.error === 'SERVER_NOT_CONFIGURED') throw new Error('NO_KEY');
+    if (data.error === 'RATE_LIMITED') throw new Error('RATE_LIMITED');
+    throw new Error(data.message || `Server error (${res.status})`);
+  }
+
+  return data.text || '';
+}
+
+function buildSystemPrompt(engineDecision, slangLevel) {
+  const substanceNotice = engineDecision.requiresSubstance
+    ? `\n\n⚠️ THIS IS A SUBSTANTIVE REQUEST (knowledge, math, code, writing, analysis, homework, or similar). The General AI Core leads completely here. Give a real, complete, correct answer first — explanation, working, code, whatever the question needs. A personality touch is only allowed as a small addition AFTER the substance is fully there, never as a replacement for it. If you're unsure or don't know something, say so plainly instead of guessing or hallucinating.`
+    : '';
+
+  return `You are Aura AI — a genuinely capable general-purpose AI assistant that also understands internet "aura farming" (deliberately doing/saying things that increase perceived coolness, confidence, charisma). The central paradox: overdoing it becomes cringe and LOSES aura. Restraint and timing matter more than volume.
+
+PRIORITY ORDER — always in this sequence, never reversed:
+1. Safety
+2. Accuracy — never sacrifice correctness for style
+3. Understanding what the user actually needs
+4. Helpfulness — fully answer the question or complete the task
+5. Natural conversation
+6. Aura / personality
+7. Extra stylistic flourish
+
+You are a real assistant first. You can explain science, math, history, code — debug programs, solve equations, summarize text, help with homework, brainstorm, reason step by step, and admit uncertainty instead of making things up. The aura personality is a communication layer on top of that competence, never a substitute for it. The user should never feel like they're talking to a meme bot instead of a real AI.
+
+For THIS response, an internal engine has already decided the following control values for the personality layer only — they govern tone, not content:
+
+- Response style: ${engineDecision.style} — ${STYLE_GUIDANCE[engineDecision.style]}
+- Aura intensity: ${engineDecision.intensity}/4 (0=none, 4=rare max — only go big if this is 3 or 4)
+- Slang guidance: ${slangGuidance(slangLevel)}${substanceNotice}
+
+Hard rules:
+- Never say "aura", "+points", or announce that you're farming aura, unless the user's message itself used that word first.
+- Never use more than 2 emoji, and only if it truly fits.
+- Keep casual responses SHORT — 1-3 sentences. For real questions or help requests, be as thorough as the question actually needs; usefulness beats brevity there.
+- Do not use "sigma", "gigachad", or similar generic internet-tough-guy language.
+- Do not repeat phrasing patterns you may have used earlier in this conversation.
+- Never be cruel, mocking, or dismissive to create "aura" — confidence is not cruelty.
+
+Respond naturally, as the character would — not like you're reading a checklist.`;
+}
+
+async function handleSend() {
+  const text = userInput.value.trim();
+  if (!text) return;
+
+  memory.advanceTurn();
+  memory._lastUserMessage = text;
+
+  addUser(text);
+  userInput.value = '';
+  userInput.style.height = 'auto';
+  sendBtn.disabled = true;
+  addLoading();
+
+  try {
+    const moodResult = detectMood(text, memory);
+    const engineDecision = runAuraEngine(text, moodResult, memory, currentMode);
+    const slangLevel = manualSlangOverride >= 0 ? manualSlangOverride : engineDecision.slangIntensity;
+
+    const systemPrompt = buildSystemPrompt(engineDecision, slangLevel);
+    let responseText;
+    try {
+      responseText = await callChatAPI(systemPrompt, text);
+    } catch (err) {
+      removeLoading();
+      sendBtn.disabled = false;
+      if (err.message === 'NO_KEY') {
+        addAI("The server isn't configured with a Gemini key yet. Whoever's running this needs to set GEMINI_API_KEY in the environment.", null, null);
+      } else if (err.message === 'RATE_LIMITED') {
+        addAI("Too many requests in a short window — give it a moment and try again.", null, null);
+      } else {
+        addAI(`Connection issue: ${err.message}`, null, null);
+      }
+      return;
+    }
+    if (!responseText) responseText = "...";
+
+    let cringeResult = runCringeCheck(responseText, engineDecision, memory);
+
+    if (cringeResult.needsRewrite) {
+      try {
+        const rewritePrompt = buildSystemPrompt(
+          { ...engineDecision, intensity: 0, style: 'concise' }, 0
+        ) + "\n\nIMPORTANT: Your previous attempt was too forced/cringe. Rewrite it plainly and helpfully with zero slang and zero attempt at being cool.";
+        const rewritten = await callChatAPI(rewritePrompt, text);
+        if (rewritten) {
+          responseText = rewritten;
+          cringeResult = runCringeCheck(responseText, { ...engineDecision, intensity: 0, cringeRiskBase: 5 }, memory);
+        }
+      } catch (e) { /* keep original if rewrite fails */ }
+    }
+
+    const scoreResult = scoreAndEvent(engineDecision, cringeResult, memory);
+
+    const slangUsed = (responseText.match(/\b(bro|bruh|fr|frfr|ngl|lowkey|highkey|bet|cooked|cooking|locked in|clutch|valid|mid|based)\b/gi) || []);
+    const emojiUsed = (responseText.match(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu) || []);
+    memory.addSlang(slangUsed);
+    memory.addEmojis(emojiUsed);
+    memory.addStyle(engineDecision.style);
+    const firstSentence = responseText.split(/(?<=[.!?])\s+/)[0];
+    if (firstSentence) memory.addPhrase(firstSentence);
+
+    chatHistory.push({ role: 'user', content: text });
+    chatHistory.push({ role: 'assistant', content: responseText });
+    chatHistory = chatHistory.slice(-16);
+
+    removeLoading();
+    const debugInfo = debugMode ? `
+      <b>AURA ENGINE</b><br>
+      Mood: ${engineDecision.mood}<br>
+      Substance: ${engineDecision.requiresSubstance ? 'Yes' : 'No'}<br>
+      Opportunity: ${engineDecision.opportunity}%<br>
+      Intensity: ${engineDecision.intensity}/4<br>
+      Style: ${engineDecision.style}<br>
+      Slang: ${slangLevel}/4<br>
+      Cringe risk: ${cringeResult.risk}%<br>
+      Mode: ${currentMode}<br>
+      Aura: ${scoreResult.delta > 0 ? '+' : ''}${scoreResult.delta}
+    ` : null;
+    addAI(responseText, debugInfo, scoreResult.event);
+    updateMeter();
+
+  } catch (err) {
+    removeLoading();
+    addAI(`Something broke: ${err.message}`, null, null);
+  } finally {
+    sendBtn.disabled = false;
+    userInput.focus();
+  }
+}
+
+sendBtn.addEventListener('click', handleSend);
+userInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); }
+});
+</script>
+</body>
+</html>
