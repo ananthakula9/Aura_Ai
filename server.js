@@ -1,18 +1,41 @@
 // Aura AI — server.js
-// Serves the static frontend and proxies chat requests to Google Gemini.
-// The API key never reaches the browser: it is read from the
-// GEMINI_API_KEY environment variable and attached here only.
+// Serves the static frontend, proxies chat requests to Google Gemini, and
+// (when DATABASE_URL is configured) provides account auth + saved
+// conversation history. Guest mode works with zero database configured —
+// auth/save-history features degrade gracefully rather than breaking chat.
 
 const express = require('express');
 const path = require('path');
+const cookieParser = require('cookie-parser');
+const db = require('./db');
+const auth = require('./auth');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const DEFAULT_MODEL = process.env.AURA_DEFAULT_MODEL || 'gemini-2.5-flash';
+const DEFAULT_MODEL = process.env.AURA_DEFAULT_MODEL || 'gemini-3.6-flash';
 const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
 
+// Models this server has verified against the current Gemini API generation.
+// Requests for anything outside this list fall back to DEFAULT_MODEL rather
+// than being sent through as-is — protects against typos and against
+// deprecated/retired model strings breaking the app silently.
+const ALLOWED_MODELS = new Set([
+  'gemini-3.6-flash',
+  'gemini-3.5-flash-lite',
+  'gemini-3.1-pro-preview',
+]);
+
+function sanitizeModel(requested) {
+  if (typeof requested === 'string' && ALLOWED_MODELS.has(requested.trim())) {
+    return requested.trim();
+  }
+  return DEFAULT_MODEL;
+}
+
 app.use(express.json({ limit: '1mb' }));
+app.use(cookieParser());
+app.use(auth.attachUser);
 app.use(express.static(path.join(__dirname, 'public')));
 
 // Simple in-memory rate limiter (per IP) so a stray loop can't burn the key's quota.
@@ -29,11 +52,30 @@ function isRateLimited(ip) {
   return recent.length > RATE_LIMIT;
 }
 
+// Separate, stricter rate limit for auth endpoints — protects against
+// credential-stuffing / brute force independent of the chat limiter.
+const authBuckets = new Map();
+const AUTH_RATE_LIMIT = 10;
+const AUTH_RATE_WINDOW_MS = 60_000;
+function isAuthRateLimited(ip) {
+  const now = Date.now();
+  const bucket = authBuckets.get(ip) || [];
+  const recent = bucket.filter(t => now - t < AUTH_RATE_WINDOW_MS);
+  recent.push(now);
+  authBuckets.set(ip, recent);
+  return recent.length > AUTH_RATE_LIMIT;
+}
+function clientIp(req) {
+  return req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
+}
+
 app.get('/api/health', (req, res) => {
   res.json({
     ok: true,
     keyConfigured: Boolean(GEMINI_API_KEY),
     defaultModel: DEFAULT_MODEL,
+    allowedModels: Array.from(ALLOWED_MODELS),
+    accountsEnabled: db.isConfigured(),
   });
 });
 
@@ -62,7 +104,7 @@ app.post('/api/chat', async (req, res) => {
       return res.status(429).json({ error: 'RATE_LIMITED', message: 'Too many requests. Slow down a moment.' });
     }
 
-    const { systemPrompt, messages, model, maxTokens, temperature } = req.body || {};
+    const { systemPrompt, messages, model, maxTokens } = req.body || {};
 
     if (!systemPrompt || !Array.isArray(messages)) {
       return res.status(400).json({ error: 'BAD_REQUEST', message: 'systemPrompt and messages[] are required.' });
@@ -70,7 +112,8 @@ app.post('/api/chat', async (req, res) => {
 
     // Cap payload size defensively — this is a chat proxy, not a general passthrough.
     const trimmedMessages = messages.slice(-20);
-    const chosenModel = model || DEFAULT_MODEL;
+    const chosenModel = sanitizeModel(model);
+    const startedAt = Date.now();
 
     const geminiRes = await fetch(`${GEMINI_BASE_URL}/${encodeURIComponent(chosenModel)}:generateContent`, {
       method: 'POST',
@@ -81,14 +124,16 @@ app.post('/api/chat', async (req, res) => {
       body: JSON.stringify({
         system_instruction: { parts: [{ text: systemPrompt }] },
         contents: toGeminiContents(trimmedMessages),
+        // Note: temperature/top_p/top_k are deprecated on Gemini 3.x models
+        // and are intentionally omitted — only maxOutputTokens is set here.
         generationConfig: {
           maxOutputTokens: Math.min(maxTokens || 700, 1200),
-          temperature: temperature ?? 0.9,
         },
       }),
     });
 
     const data = await geminiRes.json();
+    const latencyMs = Date.now() - startedAt;
 
     if (!geminiRes.ok) {
       return res.status(geminiRes.status).json({
@@ -98,11 +143,212 @@ app.post('/api/chat', async (req, res) => {
     }
 
     const text = data?.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('').trim() || '';
-    res.json({ text });
+    res.json({ text, model: chosenModel, latencyMs });
 
   } catch (err) {
     console.error('chat endpoint error:', err);
     res.status(500).json({ error: 'SERVER_ERROR', message: 'Unexpected server error.' });
+  }
+});
+
+// ============================================================
+// AUTH ROUTES
+// ============================================================
+function requireDb(req, res, next) {
+  if (!db.isConfigured()) {
+    return res.status(503).json({ error: 'ACCOUNTS_NOT_CONFIGURED', message: 'Accounts are not available — the server has no database configured.' });
+  }
+  next();
+}
+
+app.post('/api/auth/signup', requireDb, async (req, res) => {
+  try {
+    if (isAuthRateLimited(clientIp(req))) {
+      return res.status(429).json({ error: 'RATE_LIMITED', message: 'Too many attempts. Try again in a minute.' });
+    }
+    const { email, password } = req.body || {};
+    const normalizedEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
+
+    if (!auth.isValidEmail(normalizedEmail)) {
+      return res.status(400).json({ error: 'INVALID_EMAIL', message: 'Enter a valid email address.' });
+    }
+    if (!auth.isValidPassword(password)) {
+      return res.status(400).json({ error: 'INVALID_PASSWORD', message: 'Password must be at least 8 characters.' });
+    }
+
+    const existing = await db.findUserByEmail(normalizedEmail);
+    if (existing) {
+      return res.status(409).json({ error: 'EMAIL_TAKEN', message: 'An account with that email already exists.' });
+    }
+
+    const passwordHash = await auth.hashPassword(password);
+    const user = await db.createUser(normalizedEmail, passwordHash);
+    await auth.createSessionForUser(res, user.id);
+
+    res.json({ user: { id: user.id, email: user.email } });
+  } catch (err) {
+    console.error('signup error:', err);
+    res.status(500).json({ error: 'SERVER_ERROR', message: 'Could not create account.' });
+  }
+});
+
+app.post('/api/auth/login', requireDb, async (req, res) => {
+  try {
+    if (isAuthRateLimited(clientIp(req))) {
+      return res.status(429).json({ error: 'RATE_LIMITED', message: 'Too many attempts. Try again in a minute.' });
+    }
+    const { email, password } = req.body || {};
+    const normalizedEmail = typeof email === 'string' ? email.trim().toLowerCase() : '';
+
+    const user = await db.findUserByEmail(normalizedEmail);
+    // Constant-shape response whether the email exists or not, to avoid
+    // leaking which emails are registered.
+    const ok = user ? await auth.verifyPassword(password || '', user.password_hash) : false;
+
+    if (!ok) {
+      return res.status(401).json({ error: 'INVALID_CREDENTIALS', message: 'Incorrect email or password.' });
+    }
+
+    await auth.createSessionForUser(res, user.id);
+    res.json({ user: { id: user.id, email: user.email } });
+  } catch (err) {
+    console.error('login error:', err);
+    res.status(500).json({ error: 'SERVER_ERROR', message: 'Could not log in.' });
+  }
+});
+
+app.post('/api/auth/logout', async (req, res) => {
+  await auth.clearSession(req, res);
+  res.json({ ok: true });
+});
+
+app.get('/api/auth/me', (req, res) => {
+  res.json({ user: req.user || null, accountsEnabled: db.isConfigured() });
+});
+
+// Password reset without an email provider is out of scope for a minimal
+// deploy, but a signed-in user can always change their password directly.
+app.post('/api/auth/change-password', requireDb, auth.requireAuth, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body || {};
+    if (!auth.isValidPassword(newPassword)) {
+      return res.status(400).json({ error: 'INVALID_PASSWORD', message: 'New password must be at least 8 characters.' });
+    }
+    const user = await db.findUserByEmail(req.user.email);
+    const ok = user && await auth.verifyPassword(currentPassword || '', user.password_hash);
+    if (!ok) {
+      return res.status(401).json({ error: 'INVALID_CREDENTIALS', message: 'Current password is incorrect.' });
+    }
+    const newHash = await auth.hashPassword(newPassword);
+    await db.updateUserPassword(user.id, newHash);
+    // Rotate all sessions so other logged-in devices need the new password.
+    await db.deleteAllSessionsForUser(user.id);
+    await auth.createSessionForUser(res, user.id);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('change-password error:', err);
+    res.status(500).json({ error: 'SERVER_ERROR', message: 'Could not change password.' });
+  }
+});
+
+app.delete('/api/auth/account', requireDb, auth.requireAuth, async (req, res) => {
+  try {
+    await db.deleteUser(req.user.id); // cascades to sessions + conversations + messages
+    await auth.clearSession(req, res);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('account deletion error:', err);
+    res.status(500).json({ error: 'SERVER_ERROR', message: 'Could not delete account.' });
+  }
+});
+
+// ============================================================
+// CONVERSATION ROUTES (logged-in users only — guests use localStorage
+// entirely client-side and never hit these routes)
+// ============================================================
+app.get('/api/conversations', requireDb, auth.requireAuth, async (req, res) => {
+  try {
+    const list = await db.listConversations(req.user.id);
+    res.json({ conversations: list });
+  } catch (err) {
+    console.error('list conversations error:', err);
+    res.status(500).json({ error: 'SERVER_ERROR', message: 'Could not load conversations.' });
+  }
+});
+
+app.post('/api/conversations', requireDb, auth.requireAuth, async (req, res) => {
+  try {
+    const title = typeof req.body?.title === 'string' ? req.body.title.slice(0, 100) : 'New chat';
+    const convo = await db.createConversation(req.user.id, title);
+    res.json({ conversation: convo });
+  } catch (err) {
+    console.error('create conversation error:', err);
+    res.status(500).json({ error: 'SERVER_ERROR', message: 'Could not create conversation.' });
+  }
+});
+
+app.get('/api/conversations/:id', requireDb, auth.requireAuth, async (req, res) => {
+  try {
+    const convo = await db.getConversationWithMessages(req.user.id, req.params.id);
+    if (!convo) return res.status(404).json({ error: 'NOT_FOUND', message: 'Conversation not found.' });
+    res.json({ conversation: convo });
+  } catch (err) {
+    console.error('get conversation error:', err);
+    res.status(500).json({ error: 'SERVER_ERROR', message: 'Could not load conversation.' });
+  }
+});
+
+app.patch('/api/conversations/:id', requireDb, auth.requireAuth, async (req, res) => {
+  try {
+    const title = typeof req.body?.title === 'string' ? req.body.title.trim().slice(0, 100) : null;
+    if (!title) return res.status(400).json({ error: 'BAD_REQUEST', message: 'title is required.' });
+    const updated = await db.renameConversation(req.user.id, req.params.id, title);
+    if (!updated) return res.status(404).json({ error: 'NOT_FOUND', message: 'Conversation not found.' });
+    res.json({ conversation: updated });
+  } catch (err) {
+    console.error('rename conversation error:', err);
+    res.status(500).json({ error: 'SERVER_ERROR', message: 'Could not rename conversation.' });
+  }
+});
+
+app.delete('/api/conversations/:id', requireDb, auth.requireAuth, async (req, res) => {
+  try {
+    const deleted = await db.deleteConversation(req.user.id, req.params.id);
+    if (!deleted) return res.status(404).json({ error: 'NOT_FOUND', message: 'Conversation not found.' });
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('delete conversation error:', err);
+    res.status(500).json({ error: 'SERVER_ERROR', message: 'Could not delete conversation.' });
+  }
+});
+
+app.delete('/api/conversations', requireDb, auth.requireAuth, async (req, res) => {
+  try {
+    await db.deleteAllConversations(req.user.id);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('delete all conversations error:', err);
+    res.status(500).json({ error: 'SERVER_ERROR', message: 'Could not clear conversations.' });
+  }
+});
+
+app.post('/api/conversations/:id/messages', requireDb, auth.requireAuth, async (req, res) => {
+  try {
+    const { role, content } = req.body || {};
+    if (role !== 'user' && role !== 'assistant') {
+      return res.status(400).json({ error: 'BAD_REQUEST', message: 'role must be "user" or "assistant".' });
+    }
+    if (typeof content !== 'string' || !content.trim()) {
+      return res.status(400).json({ error: 'BAD_REQUEST', message: 'content is required.' });
+    }
+    const message = await db.addMessage(req.user.id, req.params.id, role, content.slice(0, 20000));
+    res.json({ message });
+  } catch (err) {
+    if (err.message === 'NOT_FOUND_OR_FORBIDDEN') {
+      return res.status(404).json({ error: 'NOT_FOUND', message: 'Conversation not found.' });
+    }
+    console.error('add message error:', err);
+    res.status(500).json({ error: 'SERVER_ERROR', message: 'Could not save message.' });
   }
 });
 
@@ -111,7 +357,28 @@ app.get('*', (req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-app.listen(PORT, () => {
-  console.log(`Aura AI server running on port ${PORT}`);
-  console.log(`Gemini key configured: ${Boolean(GEMINI_API_KEY)}`);
-});
+async function start() {
+  if (db.isConfigured()) {
+    try {
+      await db.ensureSchema();
+      console.log('Database schema ready — accounts and saved history enabled.');
+    } catch (e) {
+      console.error('Failed to initialize database schema:', e.message);
+      console.error('Accounts/saved history will not work until this is fixed.');
+    }
+  } else {
+    console.log('DATABASE_URL not set — running in guest-only mode (no accounts, no saved history).');
+  }
+
+  app.listen(PORT, () => {
+    console.log(`Aura AI server running on port ${PORT}`);
+    console.log(`Gemini key configured: ${Boolean(GEMINI_API_KEY)}`);
+  });
+}
+
+start();
+
+// Exported for testing (dispatching requests directly against the app
+// without a real HTTP listener). Railway's `npm start` runs this file
+// directly and never requires it, so this export has no production effect.
+module.exports = app;

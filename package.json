@@ -1,7 +1,7 @@
 {
   "name": "aura-ai",
-  "version": "1.0.0",
-  "description": "Aura AI — a general-purpose AI assistant with an internal aura-farming personality engine.",
+  "version": "2.0.0",
+  "description": "Aura AI — a general-purpose AI assistant with an internal aura-farming personality engine, Gemini backend, and optional accounts with saved conversation history.",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -10,6 +10,9 @@
     "node": ">=18.0.0"
   },
   "dependencies": {
-    "express": "^4.19.2"
+    "express": "^4.19.2",
+    "cookie-parser": "^1.4.6",
+    "bcryptjs": "^2.4.3",
+    "pg": "^8.11.5"
   }
 }
