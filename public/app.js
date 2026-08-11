@@ -22,28 +22,39 @@ let confidenceLevel = 3;
 let emojiFrequency = 1;
 let responseLength = 'balanced';
 let creativityLevel = 1; // 0 focused, 1 balanced, 2 creative
-let availableModels = [];
-let selectedModel = localStorage.getItem('aura_model') || 'gemini-3.6-flash';
+let availableModels = [];   // populated from /api/health: [{ displayName, isDefault }]
+let selectedModel = null;   // an Aura display name (e.g. "Aura 1 Flash") — never a raw Gemini model ID
 let inFlightController = null;
 let chatHistory = [];
 
-const CONVOS_KEY = 'aura_conversations_v1';
-let conversations = loadConversations();
-let activeConvoId = null;
+// ============================================================
+// GUEST CONVERSATION STATE — IN MEMORY ONLY, NEVER PERSISTED
+// This is the entire guest "conversation store": one plain JS object that
+// lives only as long as this page/tab does. It is intentionally NOT:
+//   - written to localStorage
+//   - written to sessionStorage
+//   - written to IndexedDB
+//   - sent to the server in any save/create/list call
+// A refresh, tab close, or reopen always starts from this same empty
+// literal below — there is no code path anywhere in this file that reads
+// a guest conversation back from any storage API. If you're looking for
+// where guest chats "persist", the answer is: nowhere, by design.
+// ============================================================
+let guestConversation = { messages: [] };
+
+let activeConvoId = null; // only meaningful for logged-in (server) conversations
 
 // ============================================================
 // AUTH STATE
-// Guests: conversations live only in localStorage (CONVOS_KEY above),
-// never sent to the server, cleared as soon as the tab/session ends
-// (localStorage persists across a refresh by design of the browser, but
-// we never write guest chats to any database — see startFreshConversation
-// and the persistToServer() guards throughout).
+// Guests: see guestConversation above — memory-only, gone on refresh.
 // Logged-in: conversations are created/read/updated via /api/conversations,
 // scoped server-side to req.user.id — see db.js for the ownership checks.
 // ============================================================
 let currentUser = null;       // { id, email } | null
 let accountsEnabled = false;  // whether the server has a database configured
+let googleOAuthEnabled = false; // whether the server has Google OAuth configured
 let authMode = 'login';       // 'login' | 'signup'
+let welcomeModalDismissedThisSession = false;
 
 // ============================================================
 // DOM REFS
@@ -114,150 +125,44 @@ document.getElementById('themeSelect').addEventListener('click', (e) => {
 });
 
 // ============================================================
-// CONVERSATION PERSISTENCE (titles/history only — no secrets)
+// GUEST CONVERSATION HANDLING — memory-only, no sidebar list
+// A guest has exactly one conversation at a time: whatever is in
+// guestConversation.messages. There is no list to search/rename/delete
+// because there is nothing saved to list — the sidebar shows a short
+// explanatory note instead (see renderGuestSidebar below). Starting a
+// "new chat" as a guest simply replaces guestConversation with a fresh
+// empty object; nothing is written anywhere first.
 // ============================================================
-function loadConversations() {
-  try {
-    const raw = localStorage.getItem(CONVOS_KEY);
-    return raw ? JSON.parse(raw) : [];
-  } catch { return []; }
-}
-function saveConversations() {
-  try { localStorage.setItem(CONVOS_KEY, JSON.stringify(conversations)); } catch { /* storage full/unavailable — non-fatal */ }
-}
-function makeConvoId() { return 'c_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8); }
-
-function createConversation() {
-  const convo = { id: makeConvoId(), title: 'New chat', messages: [], updatedAt: Date.now() };
-  conversations.unshift(convo);
-  activeConvoId = convo.id;
-  saveConversations();
-  renderSidebarList();
-  return convo;
-}
-
-function getActiveConvo() {
-  return conversations.find(c => c.id === activeConvoId) || null;
-}
-
-function touchConvo(convo, firstUserMessage) {
-  convo.updatedAt = Date.now();
-  if (convo.title === 'New chat' && firstUserMessage) {
-    convo.title = firstUserMessage.slice(0, 48) + (firstUserMessage.length > 48 ? '…' : '');
-  }
-  conversations.sort((a, b) => b.updatedAt - a.updatedAt);
-  saveConversations();
-  renderSidebarList();
-}
-
-function renderSidebarList() {
-  const query = searchInput.value.trim().toLowerCase();
-  const filtered = conversations.filter(c => !query || c.title.toLowerCase().includes(query));
-
-  sidebarList.innerHTML = '';
-  if (filtered.length === 0) {
-    const empty = document.createElement('div');
-    empty.className = 'sidebar-empty';
-    empty.textContent = query ? 'No matching conversations.' : 'No conversations yet.';
-    sidebarList.appendChild(empty);
-    return;
-  }
-
-  const label = document.createElement('div');
-  label.className = 'sidebar-section-label';
-  label.textContent = 'Recent';
-  sidebarList.appendChild(label);
-
-  filtered.forEach(convo => {
-    const item = document.createElement('div');
-    item.className = 'convo-item' + (convo.id === activeConvoId ? ' active' : '');
-    item.dataset.id = convo.id;
-
-    const titleEl = document.createElement('div');
-    titleEl.className = 'convo-title';
-    titleEl.textContent = convo.title;
-    item.appendChild(titleEl);
-
-    const actions = document.createElement('div');
-    actions.className = 'convo-actions';
-
-    const renameBtn = document.createElement('button');
-    renameBtn.className = 'convo-action-btn';
-    renameBtn.title = 'Rename';
-    renameBtn.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 00-2 2v14a2 2 0 002 2h14a2 2 0 002-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 013 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>';
-    renameBtn.addEventListener('click', (e) => { e.stopPropagation(); startRename(item, convo); });
-
-    const deleteBtn = document.createElement('button');
-    deleteBtn.className = 'convo-action-btn danger';
-    deleteBtn.title = 'Delete';
-    deleteBtn.innerHTML = '<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6h14z"/></svg>';
-    deleteBtn.addEventListener('click', (e) => { e.stopPropagation(); deleteConversation(convo.id); });
-
-    actions.appendChild(renameBtn);
-    actions.appendChild(deleteBtn);
-    item.appendChild(actions);
-
-    item.addEventListener('click', () => switchToConversation(convo.id));
-    sidebarList.appendChild(item);
-  });
-}
-
-function startRename(item, convo) {
-  const titleEl = item.querySelector('.convo-title');
-  const input = document.createElement('input');
-  input.type = 'text';
-  input.value = convo.title;
-  titleEl.textContent = '';
-  titleEl.appendChild(input);
-  input.focus();
-  input.select();
-
-  const commit = () => {
-    const v = input.value.trim();
-    if (v) convo.title = v.slice(0, 60);
-    saveConversations();
-    renderSidebarList();
-  };
-  input.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') { e.preventDefault(); commit(); }
-    if (e.key === 'Escape') { renderSidebarList(); }
-  });
-  input.addEventListener('blur', commit);
-}
-
-function deleteConversation(id) {
-  conversations = conversations.filter(c => c.id !== id);
-  saveConversations();
-  if (activeConvoId === id) {
-    if (conversations.length > 0) {
-      switchToConversation(conversations[0].id);
-    } else {
-      startFreshConversation();
-    }
-  } else {
-    renderSidebarList();
-  }
-}
-
-function switchToConversation(id) {
-  const convo = conversations.find(c => c.id === id);
-  if (!convo) return;
-  activeConvoId = id;
-  chatHistory = convo.messages.map(m => ({ role: m.role, content: m.content }));
+function startFreshGuestConversation() {
+  guestConversation = { messages: [] };
+  chatHistory = [];
   Object.assign(memory, new AuraMemory());
-  renderFullConversation(convo);
-  renderSidebarList();
-  if (window.innerWidth <= 760) closeSidebar();
+  conversationInner.innerHTML = '';
+  conversationInner.appendChild(emptyState);
+  renderGuestSidebar();
 }
 
-function renderFullConversation(convo) {
+function renderGuestSidebar() {
+  sidebarList.innerHTML = '';
+  const note = document.createElement('div');
+  note.className = 'sidebar-empty';
+  note.style.textAlign = 'left';
+  note.style.padding = '10px 8px';
+  note.style.lineHeight = '1.5';
+  note.innerHTML = 'You\u2019re browsing as a guest.<br>This chat isn\u2019t saved and will disappear on refresh.<br><br><button class="sidebar-inline-signin" id="sidebarInlineSignin">Sign in to save conversations</button>';
+  sidebarList.appendChild(note);
+  const btn = document.getElementById('sidebarInlineSignin');
+  if (btn) btn.addEventListener('click', () => openAuthModal('login'));
+}
+
+function renderGuestConversationInPlace() {
   conversationInner.innerHTML = '';
-  if (convo.messages.length === 0) {
+  if (guestConversation.messages.length === 0) {
     conversationInner.appendChild(emptyState);
     return;
   }
-  convo.messages.forEach(m => {
-    if (m.role === 'user') addUser(m.content, false);
+  guestConversation.messages.forEach(m => {
+    if (m.role === 'user') addUser(m.content, false, m.timestamp);
     else addAI(m.content, null, null, false, m.timestamp);
   });
 }
@@ -266,19 +171,20 @@ function startFreshConversation() {
   if (currentUser) {
     createServerConversation();
   } else {
-    createConversation();
+    startFreshGuestConversation();
   }
-  chatHistory = [];
-  Object.assign(memory, new AuraMemory());
-  conversationInner.innerHTML = '';
-  conversationInner.appendChild(emptyState);
 }
 
 // init happens after the auth check below (checkAuthAndInit), so the app
-// knows whether to load from localStorage (guest) or the server (account)
-// before rendering anything.
+// knows whether to show the guest's fresh in-memory conversation or load
+// the logged-in user's saved server conversations before rendering.
 
-searchInput.addEventListener('input', renderSidebarList);
+searchInput.addEventListener('input', () => {
+  if (currentUser) {
+    apiFetch('/api/conversations').then(r => r.json()).then(d => renderServerSidebarList(d.conversations || [], activeConvoId));
+  }
+  // guest sidebar has nothing to search — intentionally a no-op
+});
 
 // ============================================================
 // SIDEBAR (mobile drawer + desktop collapse)
@@ -308,10 +214,7 @@ $('clearAllBtn').addEventListener('click', async () => {
       await apiFetch('/api/conversations', { method: 'DELETE' });
       await createServerConversation();
     } else {
-      conversations = [];
-      saveConversations();
-      startFreshConversation();
-      renderSidebarList();
+      startFreshGuestConversation();
     }
     btn.dataset.confirming = '0';
     btn.innerHTML = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6h14z"/></svg> Clear all conversations';
@@ -357,14 +260,13 @@ async function checkAuthAndInit() {
   updateAccountUI();
 
   if (currentUser) {
+    markWelcomeSeen(); // an authenticated user never needs the welcome modal
     await loadServerConversationList();
   } else {
-    if (conversations.length > 0) {
-      switchToConversation(conversations[0].id);
-    } else {
-      createConversation();
-      renderSidebarList();
-    }
+    // Every load starts from a fresh, empty guest conversation — there is
+    // no prior guest state to restore from anywhere.
+    startFreshGuestConversation();
+    maybeShowWelcomeModal();
   }
 }
 
@@ -373,12 +275,21 @@ function updateAccountUI() {
   const accountAvatar = $('accountAvatar');
   const accountLabel = $('accountLabel');
   const guestBanner = $('guestBanner');
+  const sidebarCard = $('sidebarAccountCard');
+  const sidebarAvatar = $('sidebarAccountAvatar');
+  const sidebarTitle = $('sidebarAccountTitle');
+  const sidebarSub = $('sidebarAccountSub');
 
   if (currentUser) {
     accountBtn.classList.add('logged-in');
     accountAvatar.textContent = currentUser.email.slice(0, 1).toUpperCase();
     accountLabel.textContent = currentUser.email.split('@')[0];
     guestBanner.classList.remove('show');
+
+    sidebarCard.classList.add('logged-in');
+    sidebarAvatar.textContent = currentUser.email.slice(0, 1).toUpperCase();
+    sidebarTitle.textContent = currentUser.email;
+    sidebarSub.textContent = 'Account';
   } else {
     accountBtn.classList.remove('logged-in');
     accountAvatar.textContent = 'G';
@@ -386,6 +297,11 @@ function updateAccountUI() {
     if (accountsEnabled && !localStorage.getItem('aura_guest_banner_dismissed')) {
       guestBanner.classList.add('show');
     }
+
+    sidebarCard.classList.remove('logged-in');
+    sidebarAvatar.textContent = 'G';
+    sidebarTitle.textContent = 'Sign in';
+    sidebarSub.textContent = 'Save your chats';
   }
 }
 
@@ -393,25 +309,25 @@ $('guestBannerDismiss').addEventListener('click', () => {
   $('guestBanner').classList.remove('show');
   localStorage.setItem('aura_guest_banner_dismissed', '1');
 });
-$('guestBannerAuthBtn').addEventListener('click', () => openAuthModal('login'));
+$('guestBannerAuthBtn').addEventListener('click', () => openAuthModal('landing'));
 
-// ---------- account popover ----------
+// ---------- top-bar account popover ----------
 const accountBtn = $('accountBtn');
 const accountPopover = $('accountPopover');
 
-function renderAccountPopover() {
-  accountPopover.innerHTML = '';
+function buildAccountMenuItems(popoverEl) {
+  popoverEl.innerHTML = '';
   if (currentUser) {
     const header = document.createElement('div');
     header.className = 'account-popover-header';
     header.innerHTML = `<b>${escapeHtml(currentUser.email)}</b>Signed in`;
-    accountPopover.appendChild(header);
+    popoverEl.appendChild(header);
 
     const logoutBtn = document.createElement('button');
     logoutBtn.className = 'account-popover-item';
     logoutBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 01-2-2V5a2 2 0 012-2h4"/><path d="M16 17l5-5-5-5M21 12H9"/></svg> Log out';
     logoutBtn.addEventListener('click', handleLogout);
-    accountPopover.appendChild(logoutBtn);
+    popoverEl.appendChild(logoutBtn);
 
     const deleteBtn = document.createElement('button');
     deleteBtn.className = 'account-popover-item danger';
@@ -426,19 +342,13 @@ function renderAccountPopover() {
         setTimeout(() => { deleteBtn.dataset.confirming = '0'; deleteBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18M8 6V4a2 2 0 012-2h4a2 2 0 012 2v2m3 0v14a2 2 0 01-2 2H7a2 2 0 01-2-2V6h14z"/></svg> Delete account'; }, 3000);
       }
     });
-    accountPopover.appendChild(deleteBtn);
+    popoverEl.appendChild(deleteBtn);
   } else {
-    const loginBtn = document.createElement('button');
-    loginBtn.className = 'account-popover-item';
-    loginBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h4a2 2 0 012 2v14a2 2 0 01-2 2h-4"/><path d="M10 17l5-5-5-5M15 12H3"/></svg> Log in';
-    loginBtn.addEventListener('click', () => openAuthModal('login'));
-    accountPopover.appendChild(loginBtn);
-
-    const signupBtn = document.createElement('button');
-    signupBtn.className = 'account-popover-item';
-    signupBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M16 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="8.5" cy="7" r="4"/><path d="M20 8v6M23 11h-6"/></svg> Sign up';
-    signupBtn.addEventListener('click', () => openAuthModal('signup'));
-    accountPopover.appendChild(signupBtn);
+    const signinBtn = document.createElement('button');
+    signinBtn.className = 'account-popover-item';
+    signinBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M15 3h4a2 2 0 012 2v14a2 2 0 01-2 2h-4"/><path d="M10 17l5-5-5-5M15 12H3"/></svg> Sign in';
+    signinBtn.addEventListener('click', () => openAuthModal('landing'));
+    popoverEl.appendChild(signinBtn);
 
     if (!accountsEnabled) {
       const note = document.createElement('div');
@@ -446,18 +356,36 @@ function renderAccountPopover() {
       note.style.borderTop = '1px solid var(--border-soft)';
       note.style.borderBottom = 'none';
       note.textContent = 'Accounts are not configured on this server.';
-      accountPopover.appendChild(note);
+      popoverEl.appendChild(note);
     }
   }
 }
 
-accountBtn.addEventListener('click', () => { renderAccountPopover(); accountPopover.classList.toggle('open'); });
+accountBtn.addEventListener('click', () => { buildAccountMenuItems(accountPopover); accountPopover.classList.toggle('open'); });
 document.addEventListener('click', (e) => {
   if (!accountBtn.contains(e.target) && !accountPopover.contains(e.target)) accountPopover.classList.remove('open');
 });
 
-// ---------- auth modal ----------
+// ---------- sidebar account card (bottom of sidebar) ----------
+const sidebarAccountCard = $('sidebarAccountCard');
+const sidebarAccountPopover = $('sidebarAccountPopover');
+sidebarAccountCard.addEventListener('click', () => {
+  if (currentUser) {
+    buildAccountMenuItems(sidebarAccountPopover);
+    sidebarAccountPopover.classList.toggle('open');
+  } else {
+    openAuthModal('landing');
+  }
+});
+document.addEventListener('click', (e) => {
+  if (!sidebarAccountCard.contains(e.target) && !sidebarAccountPopover.contains(e.target)) sidebarAccountPopover.classList.remove('open');
+});
+
+// ---------- auth modal: landing view + email form view ----------
 const authModalOverlay = $('authModalOverlay');
+const authLandingView = $('authLandingView');
+const authFormView = $('authFormView');
+const authLandingError = $('authLandingError');
 const authForm = $('authForm');
 const authEmail = $('authEmail');
 const authPassword = $('authPassword');
@@ -467,8 +395,24 @@ const authHeadline = $('authHeadline');
 const authSubtext = $('authSubtext');
 const authSwitch = $('authSwitch');
 
-function openAuthModal(mode) {
+function openAuthModal(view) {
+  authLandingError.classList.remove('show');
+  authError.classList.remove('show');
+  if (view === 'landing') {
+    authLandingView.style.display = '';
+    authFormView.style.display = 'none';
+  } else {
+    showAuthForm(view); // 'login' | 'signup'
+  }
+  authModalOverlay.classList.add('open');
+  accountPopover.classList.remove('open');
+  sidebarAccountPopover.classList.remove('open');
+}
+
+function showAuthForm(mode) {
   authMode = mode;
+  authLandingView.style.display = 'none';
+  authFormView.style.display = '';
   authError.classList.remove('show');
   authForm.reset();
   if (mode === 'login') {
@@ -484,15 +428,29 @@ function openAuthModal(mode) {
     authSwitch.innerHTML = 'Already have an account? <button type="button" id="authSwitchBtn">Log in</button>';
     authPassword.setAttribute('autocomplete', 'new-password');
   }
-  $('authSwitchBtn').addEventListener('click', () => openAuthModal(mode === 'login' ? 'signup' : 'login'));
-  authModalOverlay.classList.add('open');
-  accountPopover.classList.remove('open');
+  $('authSwitchBtn').addEventListener('click', () => showAuthForm(mode === 'login' ? 'signup' : 'login'));
 }
+
 function closeAuthModal() { authModalOverlay.classList.remove('open'); }
 
 $('closeAuthModalBtn').addEventListener('click', closeAuthModal);
 authModalOverlay.addEventListener('click', (e) => { if (e.target === authModalOverlay) closeAuthModal(); });
-$('authGuestBtn').addEventListener('click', closeAuthModal);
+$('authGuestBtn').addEventListener('click', () => { closeAuthModal(); markWelcomeSeen(); });
+$('authShowEmailLoginBtn').addEventListener('click', () => showAuthForm('login'));
+$('authShowSignupBtn').addEventListener('click', () => showAuthForm('signup'));
+$('authBackBtn').addEventListener('click', () => { authLandingView.style.display = ''; authFormView.style.display = 'none'; });
+
+// "Continue with Google" — real server-side OAuth redirect, or a clear
+// inline error if the server hasn't been configured with Google OAuth
+// credentials. There is no fake/simulated Google login path.
+$('authGoogleBtn').addEventListener('click', () => {
+  if (!googleOAuthEnabled) {
+    authLandingError.textContent = 'Google sign-in isn\u2019t configured on this server yet. Use email instead, or continue as a guest.';
+    authLandingError.classList.add('show');
+    return;
+  }
+  window.location.href = '/api/auth/google';
+});
 
 authForm.addEventListener('submit', async (e) => {
   e.preventDefault();
@@ -518,11 +476,11 @@ authForm.addEventListener('submit', async (e) => {
     currentUser = data.user;
     updateAccountUI();
     closeAuthModal();
+    markWelcomeSeen();
     localStorage.removeItem('aura_guest_banner_dismissed');
-    // switch from whatever guest conversation was showing to the account's
-    // saved history — guest localStorage conversations are left alone on
-    // disk but no longer shown, since they were never meant to persist
-    // past this browser session anyway.
+    // The in-memory guest conversation (if any) is simply discarded —
+    // never merged into the account, never written anywhere.
+    guestConversation = { messages: [] };
     await loadServerConversationList();
   } catch (err) {
     authError.textContent = 'Could not reach the server. Try again.';
@@ -533,19 +491,44 @@ authForm.addEventListener('submit', async (e) => {
   }
 });
 
+// ---------- first-visit welcome modal ----------
+// A minimal anonymous flag — not chat data, not a token, not personal
+// information — just "has this browser already seen the welcome modal".
+// Guests who dismiss or pick a path are not re-prompted on every reload.
+const WELCOME_SEEN_KEY = 'aura_welcome_seen';
+function markWelcomeSeen() { localStorage.setItem(WELCOME_SEEN_KEY, '1'); }
+function maybeShowWelcomeModal() {
+  if (!localStorage.getItem(WELCOME_SEEN_KEY)) {
+    openAuthModal('landing');
+  }
+}
+
+// If we just came back from a Google OAuth redirect with an error, surface
+// it once and clean the URL so refreshing doesn't re-show it.
+(function checkOAuthErrorParam() {
+  const params = new URLSearchParams(window.location.search);
+  const err = params.get('auth_error');
+  if (err) {
+    openAuthModal('landing');
+    authLandingError.textContent = err;
+    authLandingError.classList.add('show');
+    params.delete('auth_error');
+    const cleanUrl = window.location.pathname + (params.toString() ? '?' + params.toString() : '');
+    window.history.replaceState({}, '', cleanUrl);
+  }
+})();
+
 async function handleLogout() {
   try { await apiFetch('/api/auth/logout', { method: 'POST' }); } catch { /* best effort */ }
   currentUser = null;
+  activeConvoId = null;
+  chatHistory = [];
   accountPopover.classList.remove('open');
   updateAccountUI();
-  // fall back to guest localStorage conversations
-  conversations = loadConversations();
-  if (conversations.length > 0) {
-    switchToConversation(conversations[0].id);
-  } else {
-    createConversation();
-    renderSidebarList();
-  }
+  // Logging out always starts a brand new, empty guest conversation — this
+  // is never the previous account's chat, and nothing from the account's
+  // saved history is copied into guest state.
+  startFreshGuestConversation();
 }
 
 async function handleDeleteAccount() {
@@ -553,10 +536,11 @@ async function handleDeleteAccount() {
     await apiFetch('/api/auth/account', { method: 'DELETE' });
   } catch { /* best effort */ }
   currentUser = null;
+  activeConvoId = null;
+  chatHistory = [];
   accountPopover.classList.remove('open');
   updateAccountUI();
-  conversations = loadConversations();
-  if (conversations.length > 0) { switchToConversation(conversations[0].id); } else { createConversation(); renderSidebarList(); }
+  startFreshGuestConversation();
 }
 
 // ---------- server-backed conversation list (logged-in users) ----------
@@ -721,11 +705,17 @@ async function checkServerHealth() {
   try {
     const res = await fetch('/api/health');
     const data = await res.json();
-    availableModels = data.allowedModels || [data.defaultModel].filter(Boolean);
-    if (!availableModels.includes(selectedModel)) selectedModel = data.defaultModel || availableModels[0];
+    // data.models is [{ displayName, description, isDefault }] — Aura
+    // branded names only, the server never sends a raw Gemini model ID here.
+    availableModels = data.models || [];
+    googleOAuthEnabled = Boolean(data.googleOAuthEnabled);
+
+    const savedModel = localStorage.getItem('aura_model');
+    const savedIsValid = savedModel && availableModels.some(m => m.displayName === savedModel);
+    selectedModel = savedIsValid ? savedModel : (data.defaultModel || availableModels[0]?.displayName || 'Aura 1 Flash');
     localStorage.setItem('aura_model', selectedModel);
 
-    populateModelSelect(data.defaultModel);
+    populateModelSelect();
     populateModelPopover();
     modelPillName.textContent = selectedModel;
 
@@ -745,13 +735,13 @@ async function checkServerHealth() {
   }
 }
 
-function populateModelSelect(defaultModel) {
+function populateModelSelect() {
   modelSelect.innerHTML = '';
   availableModels.forEach(m => {
     const opt = document.createElement('option');
-    opt.value = m;
-    opt.textContent = m + (m === defaultModel ? '  (default)' : '');
-    if (m === selectedModel) opt.selected = true;
+    opt.value = m.displayName;
+    opt.textContent = m.displayName + (m.isDefault ? '  (default)' : '');
+    if (m.displayName === selectedModel) opt.selected = true;
     modelSelect.appendChild(opt);
   });
 }
@@ -766,10 +756,11 @@ function populateModelPopover() {
   modelPopover.innerHTML = '';
   availableModels.forEach(m => {
     const item = document.createElement('div');
-    item.className = 'model-popover-item' + (m === selectedModel ? ' active' : '');
-    item.innerHTML = `<span>${m}</span><span class="check">✓</span>`;
+    item.className = 'model-popover-item' + (m.displayName === selectedModel ? ' active' : '');
+    item.innerHTML = `<span>${escapeHtml(m.displayName)}</span><span class="check">✓</span>`;
+    item.title = m.description || '';
     item.addEventListener('click', () => {
-      selectedModel = m;
+      selectedModel = m.displayName;
       localStorage.setItem('aura_model', selectedModel);
       modelPillName.textContent = selectedModel;
       populateModelSelect();
@@ -828,13 +819,7 @@ clearBtn.addEventListener('click', async () => {
     await apiFetch(`/api/conversations/${activeConvoId}`, { method: 'DELETE' });
     await createServerConversation();
   } else {
-    const convo = getActiveConvo();
-    if (convo) { convo.messages = []; convo.title = 'New chat'; saveConversations(); }
-    chatHistory = [];
-    Object.assign(memory, new AuraMemory());
-    conversationInner.innerHTML = '';
-    conversationInner.appendChild(emptyState);
-    renderSidebarList();
+    startFreshGuestConversation();
   }
   updateMeter();
   closeModal();
@@ -1009,11 +994,9 @@ function addUser(text, persist = true, timestamp = Date.now()) {
         apiFetch('/api/conversations').then(r => r.json()).then(d => renderServerSidebarList(d.conversations || [], activeConvoId));
       }).catch(err => console.error('failed to persist user message:', err));
     } else {
-      const convo = getActiveConvo();
-      if (convo) {
-        convo.messages.push({ role: 'user', content: text, timestamp });
-        touchConvo(convo, text);
-      }
+      // Guest: held only in the in-memory guestConversation object for
+      // this page's lifetime — never written to any storage API.
+      guestConversation.messages.push({ role: 'user', content: text, timestamp });
     }
   }
 }
@@ -1087,11 +1070,8 @@ function addAI(text, debugInfo, auraEvent, persist = true, timestamp = Date.now(
         body: JSON.stringify({ role: 'assistant', content: text }),
       }).catch(err => console.error('failed to persist assistant message:', err));
     } else {
-      const convo = getActiveConvo();
-      if (convo) {
-        convo.messages.push({ role: 'assistant', content: text, timestamp });
-        touchConvo(convo);
-      }
+      // Guest: in-memory only, same as the user-message branch above.
+      guestConversation.messages.push({ role: 'assistant', content: text, timestamp });
     }
   }
 }
