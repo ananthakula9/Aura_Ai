@@ -3,179 +3,282 @@
 A general-purpose AI assistant with an internal aura-farming personality
 pipeline (mood detection, query classification, aura engine, cringe
 detection, memory, scoring), a Gemini backend, a professional chat
-interface, and optional accounts with saved conversation history.
+interface, and accounts (email/password or Google) with saved conversation
+history — while guest chat remains fully available with zero persistence.
 
-## What's new in this version
+## What changed in this version
 
-**1. Fixed the Gemini model error.** `gemini-2.5-flash` was retired for new
-API keys ("no longer available to new users"). The server now defaults to
-**`gemini-3.6-flash`** and validates every model request against an
-allowlist (`ALLOWED_MODELS` in `server.js`) — an unrecognized or deprecated
-model string silently falls back to the default instead of breaking the
-app. Change it anytime via the `AURA_DEFAULT_MODEL` environment variable
-or per-session in Settings → General → Model.
+**1. Fixed a real guest-persistence bug.** Guest conversations were being
+written to `localStorage` (key `aura_conversations_v1`) and restored on
+every page load — meaning a "guest" chat quietly survived refreshes and
+reopens. This has been completely removed. Guest state now lives in a
+single in-memory JavaScript object (`guestConversation` in `app.js`) that
+is discarded on refresh, tab close, "New chat," or logout. Verified by:
+statically auditing every remaining `localStorage` call in `app.js` (only
+theme, a "welcome seen" flag, a "guest banner dismissed" flag, and the
+selected model name remain — no chat content), and by loading the real
+`app.js` against a hand-built DOM/localStorage stub, driving an actual
+simulated send-message interaction through the real `handleSend()` code
+path, and confirming the resulting `localStorage` contents contain no
+trace of the message text.
 
-**2. Professional UI rebuild.** The interface no longer looks like a game
-dashboard — it's an original design (not a copy of ChatGPT/Claude/Grok)
-built around a deep charcoal palette with a violet→cyan "aura" gradient
-used as a single signature accent: a glow ring around the AI avatar that
-scales with that response's aura intensity. Includes markdown rendering,
-syntax-highlighted code blocks with copy buttons, message timestamps,
-copy/regenerate/stop-generation controls, polished error cards with retry,
-a collapsible sidebar with conversation search/rename/delete, a full
-Settings panel (General / Personality / Conversation / Developer tabs),
-light/dark/system theme, and mobile-safe layout (keyboard-aware input,
-horizontally scrollable code blocks, slide-out drawer sidebar).
+**2. Aura-branded model names.** The UI never shows a raw Gemini model ID.
+`models.js` maintains the only mapping between user-facing names and real
+API model IDs:
 
-**3. Accounts + guest mode.** See below.
+| Display name (what users see) | Gemini model ID (server-side only) |
+|---|---|
+| **Aura 1 Flash** (default) | `gemini-3.6-flash` |
+| Aura 1 Flash Lite | `gemini-3.5-flash-lite` |
+| Aura 1 Pro | `gemini-3.1-pro-preview` |
+
+The browser only ever sends/receives display names. `/api/chat` resolves
+a display name to a real model ID via a fixed lookup table — anything not
+in that table (a stale cached value, a forged request, a typo) silently
+falls back to the default rather than being passed through to Google.
+This was verified with a direct forgery test: a request with
+`model: "gemini-2.5-flash"` sent straight to `/api/chat` still resolves to
+and returns `"Aura 1 Flash"`, proving arbitrary strings can't reach the
+Gemini API.
+
+**3. "Continue with Google."** Real, server-side OAuth 2.0 (authorization
+code flow) — not a fake button. See the Google OAuth section below. If
+`GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET`/`GOOGLE_REDIRECT_URI` aren't all
+set, the button still appears (per the intended UX — guests shouldn't see
+a broken-looking landing screen) but clicking it shows a plain "Google
+sign-in isn't configured on this server yet" message instead of pretending
+to authenticate.
+
+**4. Professional first-visit welcome modal.** A logged-out visitor sees a
+centered modal: Aura AI logo, "Your AI. Your vibe.", then Continue with
+Google / Sign in with Email / Create an Account / Continue as Guest — no
+aura meters, scores, or slang on this screen. Guests who dismiss it or
+pick "Continue as Guest" aren't re-prompted on every reload; a single
+anonymous flag (`aura_welcome_seen`, no chat data, no token, no personal
+information) tracks that this browser has already seen it.
+
+**5. Sidebar account area.** Bottom of the sidebar now shows a proper
+account card — "Sign in / Save your chats" when logged out, or the user's
+email under an "Account" label when logged in, opening the same account
+menu (Log out, Delete account) as the top-bar avatar.
 
 ## Architecture
 
 ```
 Browser
-  ↓  POST /api/chat  { systemPrompt, messages, model }
-  ↓  POST/GET /api/auth/*, /api/conversations/*  (cookie-based session)
+  ↓  POST /api/chat  { systemPrompt, messages, model: "Aura 1 Flash" }
+  ↓  /api/auth/*  (email/password + Google OAuth, cookie-based sessions)
+  ↓  /api/conversations/*  (logged-in users only)
 Railway server (server.js)
+  ↓  models.js resolves "Aura 1 Flash" → gemini-3.6-flash
   ↓  GEMINI_API_KEY from process.env → Gemini API
   ↓  DATABASE_URL from process.env → Postgres (accounts + saved chats)
+  ↓  GOOGLE_CLIENT_ID/SECRET from process.env → Google OAuth (oauth.js)
 Response
   ↓
 Browser
 ```
 
-The Gemini key and database credentials are read once, server-side, from
-environment variables. Neither ever reaches the browser, ever appears in
-`index.html`/`app.js`/`pipeline.js`, and ever gets written to
-`localStorage`. Authentication uses an opaque, randomly generated session
-token stored in Postgres and delivered to the browser only as an
-**HTTP-only cookie** — JavaScript in the browser cannot read it, and no
-JWT or other self-describing token is used.
+No secret (Gemini key, database credentials, Google client secret, session
+tokens, password hashes) ever reaches `public/index.html`, `public/app.js`,
+or `public/pipeline.js` — grep those files yourself; none of these strings
+appear there, only the *names* of the required environment variables in
+user-facing help text for when something isn't configured.
 
 ## Guest mode vs. accounts
 
-Both use the exact same Aura AI — same Gemini backend, same Aura Engine,
-Query Classifier, Mood Detector, Cringe Detector, memory, and scoring.
-The only difference is persistence:
+Both use the exact same Aura AI — same Gemini backend (via Aura-branded
+model names), same Aura Engine, Query Classifier, Mood Detector, Cringe
+Detector, memory, and scoring. The only difference is persistence:
 
-| | Guest | Logged in |
+| | Guest | Logged in (email or Google) |
 |---|---|---|
-| Chat works fully | ✅ | ✅ |
+| Chat works fully, no forced signup | ✅ | ✅ |
 | Aura personality engine | ✅ full | ✅ full |
-| Conversation history | Browser `localStorage` only | Saved server-side in Postgres |
-| Survives closing the tab | Only within that browser's storage — never sent to or restored from a database | Yes, across devices |
-| Requires login to chat | **No** | — |
+| Conversation history | Exists only in page memory | Saved server-side in Postgres |
+| Survives refresh / reopening the site | **No — always starts fresh** | Yes, across devices |
+| Sidebar shows saved conversation list | No (nothing to list) | Yes — search, rename, delete |
 
-A guest can start chatting immediately with no popup or forced signup —
-there's a "Continue as guest" option right on the login/signup modal, and
-the modal itself is optional; closing it or ignoring the account button
-works the same way. A dismissible banner reminds guests their chat is
-temporary and offers a one-click path to log in or sign up if they want
-to keep it.
+On logout, the previous account's conversations stay safely in Postgres,
+untouched — the UI simply drops to a brand-new, empty guest conversation.
+Nothing from the account is copied into guest state, and nothing from a
+guest session is ever copied into an account (guest state is discarded
+outright, both on login/signup success and on logout).
 
-If no database is configured at all (`DATABASE_URL` unset), the entire
-account system quietly disables itself — the account button still shows,
-but signup/login return a clear "accounts aren't configured" message
-instead of erroring, and guest chat is completely unaffected.
+## Google OAuth setup
+
+1. **Google Cloud Console** → APIs & Services → Credentials → **Create
+   Credentials → OAuth 2.0 Client ID** → Application type: **Web
+   application**.
+2. Under **Authorized redirect URIs**, add:
+   ```
+   https://YOUR-RAILWAY-DOMAIN/api/auth/google/callback
+   ```
+   (and `http://localhost:3000/api/auth/google/callback` too, if you want
+   to test Google sign-in locally.)
+3. Copy the generated **Client ID** and **Client Secret**.
+4. On Railway → your service → Variables, set:
+   ```
+   GOOGLE_CLIENT_ID = your-client-id.apps.googleusercontent.com
+   GOOGLE_CLIENT_SECRET = your-client-secret
+   GOOGLE_REDIRECT_URI = https://YOUR-RAILWAY-DOMAIN/api/auth/google/callback
+   ```
+   All three are required together — the app checks `isConfigured()` in
+   `oauth.js`, which is only `true` when all three are present.
+
+**How sign-in works:** clicking "Continue with Google" redirects the
+browser to `/api/auth/google`, which sets a short-lived, `httpOnly` CSRF
+state cookie and redirects to Google's consent screen. Google redirects
+back to `/api/auth/google/callback` with a code and the same state value;
+the server verifies the state matches (rejecting the request outright if
+it doesn't or if the cookie is missing), exchanges the code for tokens
+directly with Google's token endpoint (server-to-server, using the client
+secret), fetches the user's email/name/picture, and either links to an
+existing email/password account with the same email or creates a new
+Google-only account (no password). A normal session cookie is then set,
+identical in form to an email/password login.
 
 ## Security notes
 
-- **Passwords:** hashed with bcrypt (12 rounds) via `bcryptjs`. Never
-  stored or logged in plain text.
-- **Sessions:** a random 32-byte token (`crypto.randomBytes`), stored in a
-  `sessions` table with an expiry, set as an `httpOnly`, `sameSite=lax`
-  cookie, and `secure` (HTTPS-only) whenever `NODE_ENV=production`.
-- **Conversation isolation:** every conversation and message query in
-  `db.js` is scoped by `user_id` at the SQL level — there is no code path
-  that returns or modifies another user's data. `addMessage` additionally
-  verifies conversation ownership before inserting.
-- **Rate limiting:** two independent in-memory limiters — 30 req/min per
-  IP for `/api/chat`, and a stricter 10 req/min per IP specifically for
-  `/api/auth/*` to slow down credential-stuffing attempts.
-- **No secrets in the frontend:** `GEMINI_API_KEY` and `DATABASE_URL` are
-  read only in `server.js`/`db.js`, which run server-side. Grep the
-  `public/` folder yourself — neither value appears there.
+- **Passwords:** bcrypt, 12 rounds. A Google-only account has no password
+  at all (`password_hash` is nullable) — email/password login for such an
+  account fails cleanly rather than crashing.
+- **Sessions:** random 32-byte token stored server-side in Postgres,
+  delivered as an `httpOnly`, `sameSite=lax` cookie, `secure` (HTTPS-only)
+  whenever `NODE_ENV=production`.
+- **OAuth CSRF protection:** a random `state` value round-trips through a
+  short-lived cookie; the callback rejects the request if the returned
+  state doesn't match or the cookie is missing entirely. Verified with a
+  direct test using a forged mismatched state and a request with the
+  state cookie stripped — both correctly rejected with no session created.
+- **Conversation isolation:** every query in `db.js` is scoped by
+  `user_id`. `addMessage` additionally verifies conversation ownership
+  before inserting.
+- **Model allowlist:** `/api/chat` never forwards a client-supplied model
+  string directly to Gemini — it's only ever used as a lookup key into
+  `models.js`'s fixed registry.
+- **Rate limiting:** 30 req/min per IP on `/api/chat`, 10 req/min per IP
+  on `/api/auth/*`.
 
 ## Project structure
 
 ```
 aura-ai/
-├── server.js              # Express app: static frontend, /api/chat (Gemini), auth + conversation routes
-├── db.js                   # Postgres access layer — schema + all queries, scoped by user_id
-├── auth.js                  # Password hashing, session tokens, auth middleware
-├── package.json               # dependencies: express, cookie-parser, bcryptjs, pg
-├── railway.json                 # Railway build/deploy config
-├── .env.example                   # environment variable reference
+├── server.js         # Express app: static frontend, /api/chat (Gemini via models.js), auth + OAuth + conversation routes
+├── models.js          # Aura display name ↔ Gemini model ID registry (the only place this mapping lives)
+├── oauth.js            # Google OAuth 2.0 authorization code flow (server-side only)
+├── db.js                # Postgres access layer — schema (incl. Google OAuth columns) + all queries, scoped by user_id
+├── auth.js                # Password hashing, session tokens, auth middleware
+├── package.json              # dependencies: express, cookie-parser, bcryptjs, pg (no OAuth library needed — plain fetch)
+├── railway.json                # Railway build/deploy config
+├── .env.example                  # environment variable reference, incl. Google OAuth
 ├── .gitignore
 └── public/
-    ├── index.html          # UI shell + all styles (design tokens, layout, components)
-    ├── app.js               # Frontend logic: chat, markdown rendering, settings, auth UI, conversation sync
+    ├── index.html          # UI shell + styles — welcome modal, sidebar account card, settings
+    ├── app.js               # Frontend logic: chat, markdown rendering, settings, auth UI (landing + email form + Google), guest/account conversation handling
     └── pipeline.js            # Aura pipeline — mood detector, engine, cringe detector, memory, scoring (unchanged)
 ```
 
 ## Deploy to Railway
 
-1. **Push this project to a GitHub repo** (or deploy directly from this
-   folder with the Railway CLI: `railway init` then `railway up`).
-
-2. **Create a new Railway project** → "Deploy from GitHub repo".
-
-3. **Add a Postgres database** (optional, but required for accounts/saved
-   history): in your Railway project, click **+ New → Database →
-   PostgreSQL**. Railway automatically injects `DATABASE_URL` into your
-   app service — you don't need to copy/paste anything for this. Skip
-   this step entirely to run guest-only with no accounts.
-
-4. **Set environment variables.** In your app service → Variables:
+1. Push to GitHub, then **Deploy from GitHub repo** on Railway.
+2. **Add Postgres** (optional, for accounts): **+ New → Database →
+   PostgreSQL**. `DATABASE_URL` is injected automatically.
+3. **Set environment variables** (Variables tab):
    ```
    GEMINI_API_KEY = your-real-gemini-key
    ```
-   Get a free key at https://aistudio.google.com/apikey.
-
-   Optional:
-   ```
-   AURA_DEFAULT_MODEL = gemini-3.6-flash
-   NODE_ENV = production
-   ```
-   `PORT` and `DATABASE_URL` (if you added Postgres) are set automatically
-   by Railway — don't set `PORT` manually, and don't set `DATABASE_URL`
-   yourself unless you're intentionally pointing at a different database.
-
-5. **Deploy.** Railway auto-detects Node via Nixpacks, runs `npm install`,
-   then `npm start`. On first boot with a database attached, the server
-   automatically creates all required tables (`users`, `sessions`,
-   `conversations`, `messages`) — no manual migration step needed.
-
-6. **Open the generated Railway URL.** Settings → General should show
-   "Connected — server key configured". If you added Postgres, the
-   account button (top right) will offer Log in / Sign up; without it,
-   the app runs in guest-only mode automatically.
+   Optional: `AURA_DEFAULT_MODEL`, `NODE_ENV=production`, and the three
+   `GOOGLE_*` variables above for Google sign-in.
+4. **Deploy.** Railway runs `npm install` then `npm start`. On first boot
+   with Postgres attached, the server creates all tables automatically —
+   including migration-safe `ALTER TABLE` statements so upgrading an
+   already-deployed database (adding Google OAuth columns to an existing
+   `users` table) is a no-op-safe operation, not a destructive migration.
+5. Open the Railway URL — first-time logged-out visitors see the welcome
+   modal; Settings → General shows connection status for Gemini, and the
+   account area reflects whether Postgres/Google OAuth are configured.
 
 ## Local development
 
 ```bash
 npm install
 cp .env.example .env
-# edit .env: add your real GEMINI_API_KEY, and DATABASE_URL if you want
-# to test accounts locally (point it at a local or Railway-hosted Postgres)
+# edit .env: GEMINI_API_KEY required; DATABASE_URL and GOOGLE_* optional
 export GEMINI_API_KEY=your-real-gemini-key
-export DATABASE_URL=postgresql://...   # optional — omit to run guest-only
 npm start
 ```
 
-Then open http://localhost:3000. Leave `NODE_ENV` unset locally so
-session cookies work over plain `http://` — set it to `production` only
-when actually deployed behind HTTPS.
+Open http://localhost:3000. Leave `NODE_ENV` unset locally so cookies work
+over plain `http://`.
 
-## Notes
+## Testing performed on this version
 
-- If `gemini-3.6-flash` is ever itself retired, update `ALLOWED_MODELS`
-  and `DEFAULT_MODEL` in `server.js` (and the matching list in the
-  Settings model dropdown, populated automatically from `/api/health`) —
-  everything else keeps working unchanged.
-- Password reset via email is out of scope for a minimal deploy (no email
-  provider is wired up). A logged-in user can change their password
-  directly from a signed-in session; this rotates all existing sessions
-  for that account.
-- The in-memory rate limiters reset on redeploy/restart — fine for a
-  small personal deployment, not meant as production-grade abuse
-  protection at scale.
+Everything below was actually executed, not just read for plausibility —
+using a hand-built Express/Postgres test harness (this sandbox has no
+package registry access, so real `npm install`/live Postgres wasn't
+possible; the harness simulates their request/response and query
+contracts closely enough to exercise the real, unmodified application
+code, and every harness bug hit during development was found, diagnosed,
+and fixed before trusting its results).
+
+- **Backend syntax**: `server.js`, `db.js`, `auth.js`, `models.js`,
+  `oauth.js` all pass `node --check`.
+- **Frontend syntax**: `app.js` passes `node --check`; the module also
+  loads and runs to completion (all top-level code, all event listener
+  registration, the full async `checkAuthAndInit()`) against a hand-built
+  DOM/localStorage stub with zero errors.
+- **Google OAuth end-to-end** (9 checks): health reports `googleOAuthEnabled`
+  correctly; `/api/auth/google` redirects to Google with a state cookie
+  set; callback with a valid code+state creates a session that resolves to
+  the correct Google user; mismatched state rejected; missing state cookie
+  rejected; Google denial handled without crashing; a second login with
+  the same Google ID returns to the same account rather than duplicating
+  it; a Google login using an email that already has a password account
+  links to that same account (verified by matching user ID) instead of
+  creating a duplicate.
+- **Model registry & forgery protection**: public model list never
+  contains a raw Gemini ID; valid display names resolve correctly; a
+  forged raw model ID (`gemini-2.5-flash`) sent directly to `/api/chat`
+  safely falls back to the default and the response correctly reports
+  `"Aura 1 Flash"`.
+- **Guest-mode persistence**: static audit of every `localStorage` call in
+  `app.js` (none touch chat content); a real simulated send-message flow
+  driven through the actual `handleSend()` code path against a DOM stub,
+  confirming zero chat content in resulting storage; a simulated fresh
+  module load (representing a refresh) with pre-existing storage state
+  present still renders only the empty state, no restored messages.
+- **Auth flows**: signup, duplicate-email rejection, wrong-password
+  rejection, correct login, logout + session invalidation — all via
+  real HTTP-shaped requests against the actual route handlers.
+- **Cross-user isolation**: a second user gets 404 attempting to read
+  *or* rename the first user's conversation.
+- **Rate limiting**: auth endpoint burst test confirms the 429 response
+  fires under load.
+- **CSS cascade for the new auth modal / sidebar account card**: traced
+  actual specificity and media-query nesting (not just selector
+  presence); found and fixed a real bug where the auth modal had no
+  scroll capability, meaning content could be clipped unreachably on
+  short/landscape mobile viewports; found and hardened a fragile
+  inline-style-dependent positioning rule for the sidebar popover;
+  added a global `:focus-visible` style since no button previously had
+  any visible keyboard-focus indicator beyond the browser default.
+- **DOM/ID consistency**: every `$('id')` reference in `app.js` (76
+  total) cross-checked against `index.html` — zero missing elements;
+  zero duplicate `id` attributes anywhere in the page.
+
+### Known limitations
+
+- This sandbox cannot run a live `npm install` (no package registry
+  access) or connect to a real Postgres/Railway instance, so final
+  confirmation on an actual Railway deployment with real Gemini/Google
+  credentials is still worth doing once — the test harness closely
+  mirrors Express's and `pg`'s real contracts, but "closely mirrors" is
+  not "is."
+- No automated test exists for actual pixel rendering (font metrics,
+  exact wrapping) — the CSS cascade/specificity/overflow analysis is
+  real and mathematically grounded in the actual property values, but a
+  quick manual look on a real device after deploying is still worthwhile.
+- Password reset via email is out of scope (no email provider wired up).
+  A signed-in user can change their password directly, which rotates all
+  existing sessions for that account.

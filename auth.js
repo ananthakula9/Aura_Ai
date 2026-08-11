@@ -26,6 +26,10 @@ async function hashPassword(plain) {
 }
 
 async function verifyPassword(plain, hash) {
+  // A Google-only account has no password_hash at all — there is nothing
+  // to compare against, so email/password login must fail cleanly rather
+  // than throwing inside bcrypt on a null hash.
+  if (!hash) return false;
   return bcrypt.compare(plain, hash);
 }
 

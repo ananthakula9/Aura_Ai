@@ -38,10 +38,23 @@ async function ensureSchema() {
     CREATE TABLE IF NOT EXISTS users (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       email TEXT UNIQUE NOT NULL,
-      password_hash TEXT NOT NULL,
+      password_hash TEXT,
+      google_id TEXT UNIQUE,
+      display_name TEXT,
+      avatar_url TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT now()
     );
   `);
+
+  // Migration-safe additions for databases created by earlier versions of
+  // this app (before Google OAuth existed) — IF NOT EXISTS makes this a
+  // no-op on a fresh install and a safe upgrade on an existing production
+  // database. password_hash is relaxed to nullable here too, since a
+  // Google-only account has no password.
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS google_id TEXT UNIQUE;`).catch(() => {});
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS display_name TEXT;`).catch(() => {});
+  await query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_url TEXT;`).catch(() => {});
+  await query(`ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL;`).catch(() => {});
 
   await query(`
     CREATE TABLE IF NOT EXISTS sessions (
@@ -97,8 +110,38 @@ async function findUserByEmail(email) {
 }
 
 async function findUserById(id) {
-  const res = await query(`SELECT id, email, created_at FROM users WHERE id = $1`, [id]);
+  const res = await query(`SELECT id, email, display_name, avatar_url, created_at FROM users WHERE id = $1`, [id]);
   return res.rows[0] || null;
+}
+
+async function findUserByGoogleId(googleId) {
+  const res = await query(`SELECT * FROM users WHERE google_id = $1`, [googleId]);
+  return res.rows[0] || null;
+}
+
+// Finds or creates a user for a Google-authenticated sign-in. If an
+// account with this email already exists (created via email/password
+// signup), the Google identity is linked to it rather than creating a
+// duplicate account — same person, same conversations either way they
+// log in. A brand-new Google-only account has no password_hash at all.
+async function findOrCreateGoogleUser({ googleId, email, displayName, avatarUrl }) {
+  const byGoogleId = await findUserByGoogleId(googleId);
+  if (byGoogleId) return byGoogleId;
+
+  const byEmail = await findUserByEmail(email);
+  if (byEmail) {
+    await query(
+      `UPDATE users SET google_id = $1, display_name = COALESCE(display_name, $2), avatar_url = COALESCE(avatar_url, $3) WHERE id = $4`,
+      [googleId, displayName, avatarUrl, byEmail.id]
+    );
+    return { ...byEmail, google_id: googleId };
+  }
+
+  const res = await query(
+    `INSERT INTO users (email, google_id, display_name, avatar_url) VALUES ($1, $2, $3, $4) RETURNING *`,
+    [email, googleId, displayName, avatarUrl]
+  );
+  return res.rows[0];
 }
 
 async function updateUserPassword(id, passwordHash) {
@@ -203,7 +246,7 @@ async function addMessage(userId, convoId, role, content) {
 module.exports = {
   isConfigured,
   ensureSchema,
-  createUser, findUserByEmail, findUserById, updateUserPassword, deleteUser,
+  createUser, findUserByEmail, findUserById, findUserByGoogleId, findOrCreateGoogleUser, updateUserPassword, deleteUser,
   createSession, findSession, deleteSession, deleteAllSessionsForUser,
   listConversations, createConversation, getConversationWithMessages,
   renameConversation, deleteConversation, deleteAllConversations, addMessage,

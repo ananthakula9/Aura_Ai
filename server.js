@@ -9,29 +9,22 @@ const path = require('path');
 const cookieParser = require('cookie-parser');
 const db = require('./db');
 const auth = require('./auth');
+const models = require('./models');
+const oauth = require('./oauth');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const DEFAULT_MODEL = process.env.AURA_DEFAULT_MODEL || 'gemini-3.6-flash';
 const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
 
-// Models this server has verified against the current Gemini API generation.
-// Requests for anything outside this list fall back to DEFAULT_MODEL rather
-// than being sent through as-is — protects against typos and against
-// deprecated/retired model strings breaking the app silently.
-const ALLOWED_MODELS = new Set([
-  'gemini-3.6-flash',
-  'gemini-3.5-flash-lite',
-  'gemini-3.1-pro-preview',
-]);
-
-function sanitizeModel(requested) {
-  if (typeof requested === 'string' && ALLOWED_MODELS.has(requested.trim())) {
-    return requested.trim();
-  }
-  return DEFAULT_MODEL;
-}
+// AURA_DEFAULT_MODEL, if set, overrides which registry entry's apiModel
+// backs "the default" — but the env var must name a real Gemini model ID
+// that already exists in models.js's registry, keeping the allowlist
+// guarantee intact even when overridden.
+const envDefaultOverride = process.env.AURA_DEFAULT_MODEL;
+const DEFAULT_API_MODEL = (envDefaultOverride && models.MODEL_REGISTRY.some(m => m.apiModel === envDefaultOverride))
+  ? envDefaultOverride
+  : models.resolveApiModel(models.DEFAULT_DISPLAY_NAME);
 
 app.use(express.json({ limit: '1mb' }));
 app.use(cookieParser());
@@ -73,9 +66,10 @@ app.get('/api/health', (req, res) => {
   res.json({
     ok: true,
     keyConfigured: Boolean(GEMINI_API_KEY),
-    defaultModel: DEFAULT_MODEL,
-    allowedModels: Array.from(ALLOWED_MODELS),
+    defaultModel: models.DEFAULT_DISPLAY_NAME, // Aura display name, never a raw Gemini model ID
+    models: models.getPublicModelList(),        // [{ displayName, description, isDefault }]
     accountsEnabled: db.isConfigured(),
+    googleOAuthEnabled: oauth.isConfigured(),
   });
 });
 
@@ -112,10 +106,24 @@ app.post('/api/chat', async (req, res) => {
 
     // Cap payload size defensively — this is a chat proxy, not a general passthrough.
     const trimmedMessages = messages.slice(-20);
-    const chosenModel = sanitizeModel(model);
+
+    // `model` here is an Aura display name from the browser (e.g. "Aura 1
+    // Flash"), never a raw Gemini model ID — resolveApiModel is the only
+    // place that turns it into something sent to Google, and it always
+    // falls back to the default for anything not in the registry. This is
+    // the enforcement point that stops arbitrary model IDs from reaching
+    // the Gemini API via a forged request.
+    const requestedDisplayName = typeof model === 'string' ? model.trim() : '';
+    const displayNameForResponse = models.isKnownDisplayName(requestedDisplayName)
+      ? requestedDisplayName
+      : models.DEFAULT_DISPLAY_NAME;
+    const apiModel = requestedDisplayName
+      ? models.resolveApiModel(requestedDisplayName)
+      : DEFAULT_API_MODEL;
+
     const startedAt = Date.now();
 
-    const geminiRes = await fetch(`${GEMINI_BASE_URL}/${encodeURIComponent(chosenModel)}:generateContent`, {
+    const geminiRes = await fetch(`${GEMINI_BASE_URL}/${encodeURIComponent(apiModel)}:generateContent`, {
       method: 'POST',
       headers: {
         'x-goog-api-key': GEMINI_API_KEY,
@@ -136,6 +144,30 @@ app.post('/api/chat', async (req, res) => {
     const latencyMs = Date.now() - startedAt;
 
     if (!geminiRes.ok) {
+      // If the specific model Google rejected was a non-default pick, retry
+      // once against the default rather than surfacing a raw Gemini error
+      // about an internal model ID the user was never shown.
+      if (apiModel !== DEFAULT_API_MODEL && (geminiRes.status === 404 || geminiRes.status === 400)) {
+        const retryRes = await fetch(`${GEMINI_BASE_URL}/${encodeURIComponent(DEFAULT_API_MODEL)}:generateContent`, {
+          method: 'POST',
+          headers: { 'x-goog-api-key': GEMINI_API_KEY, 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            system_instruction: { parts: [{ text: systemPrompt }] },
+            contents: toGeminiContents(trimmedMessages),
+            generationConfig: { maxOutputTokens: Math.min(maxTokens || 700, 1200) },
+          }),
+        });
+        const retryData = await retryRes.json();
+        if (retryRes.ok) {
+          const retryText = retryData?.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('').trim() || '';
+          return res.json({
+            text: retryText,
+            model: models.DEFAULT_DISPLAY_NAME,
+            latencyMs: Date.now() - startedAt,
+            modelFallback: true,
+          });
+        }
+      }
       return res.status(geminiRes.status).json({
         error: 'UPSTREAM_ERROR',
         message: data?.error?.message || 'Gemini request failed.',
@@ -143,7 +175,7 @@ app.post('/api/chat', async (req, res) => {
     }
 
     const text = data?.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('').trim() || '';
-    res.json({ text, model: chosenModel, latencyMs });
+    res.json({ text, model: displayNameForResponse, latencyMs });
 
   } catch (err) {
     console.error('chat endpoint error:', err);
@@ -223,7 +255,72 @@ app.post('/api/auth/logout', async (req, res) => {
 });
 
 app.get('/api/auth/me', (req, res) => {
-  res.json({ user: req.user || null, accountsEnabled: db.isConfigured() });
+  res.json({ user: req.user || null, accountsEnabled: db.isConfigured(), googleOAuthEnabled: oauth.isConfigured() });
+});
+
+// ============================================================
+// GOOGLE OAUTH ROUTES
+// Standard server-side authorization code flow. The client secret and
+// the token exchange itself never touch the browser — the browser is
+// only ever redirected to Google and then back to our own callback,
+// which does the real work and finishes by setting the same kind of
+// httpOnly session cookie email/password login uses.
+// ============================================================
+app.get('/api/auth/google', requireDb, (req, res) => {
+  if (!oauth.isConfigured()) {
+    return res.status(503).json({
+      error: 'GOOGLE_OAUTH_NOT_CONFIGURED',
+      message: 'Google sign-in is not set up on this server yet.',
+    });
+  }
+  const state = oauth.generateState();
+  res.cookie(oauth.STATE_COOKIE, state, oauth.stateCookieOptions());
+  res.redirect(oauth.buildAuthUrl(state));
+});
+
+app.get('/api/auth/google/callback', requireDb, async (req, res) => {
+  const failRedirect = (reason) => res.redirect(`/?auth_error=${encodeURIComponent(reason)}`);
+
+  if (!oauth.isConfigured()) {
+    return failRedirect('Google sign-in is not configured on this server.');
+  }
+
+  try {
+    const { code, state, error: googleError } = req.query;
+
+    if (googleError) {
+      return failRedirect('Google sign-in was cancelled or denied.');
+    }
+
+    const expectedState = req.cookies?.[oauth.STATE_COOKIE];
+    res.clearCookie(oauth.STATE_COOKIE, { path: '/' });
+    if (!state || !expectedState || state !== expectedState) {
+      return failRedirect('Sign-in request could not be verified. Please try again.');
+    }
+    if (!code) {
+      return failRedirect('Google did not return an authorization code.');
+    }
+
+    const tokens = await oauth.exchangeCodeForTokens(code);
+    const profile = await oauth.fetchGoogleProfile(tokens.access_token);
+
+    if (!profile.email) {
+      return failRedirect('Your Google account has no email address to sign in with.');
+    }
+
+    const user = await db.findOrCreateGoogleUser({
+      googleId: profile.sub,
+      email: profile.email.toLowerCase(),
+      displayName: profile.name || null,
+      avatarUrl: profile.picture || null,
+    });
+
+    await auth.createSessionForUser(res, user.id);
+    res.redirect('/');
+  } catch (err) {
+    console.error('Google OAuth callback error:', err.message);
+    failRedirect('Something went wrong finishing Google sign-in. Please try again.');
+  }
 });
 
 // Password reset without an email provider is out of scope for a minimal
