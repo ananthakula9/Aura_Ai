@@ -1,5 +1,6 @@
 // Aura AI — server.js
-// Serves the static frontend, proxies chat requests to Google Gemini, and
+// Serves the static frontend, routes chat requests to Gemini and/or
+// Mistral per each Aura model's provider strategy (see models.js), and
 // (when DATABASE_URL is configured) provides account auth + saved
 // conversation history. Guest mode works with zero database configured —
 // auth/save-history features degrade gracefully rather than breaking chat.
@@ -11,20 +12,12 @@ const db = require('./db');
 const auth = require('./auth');
 const models = require('./models');
 const oauth = require('./oauth');
+const providers = require('./providers');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
-
-// AURA_DEFAULT_MODEL, if set, overrides which registry entry's apiModel
-// backs "the default" — but the env var must name a real Gemini model ID
-// that already exists in models.js's registry, keeping the allowlist
-// guarantee intact even when overridden.
-const envDefaultOverride = process.env.AURA_DEFAULT_MODEL;
-const DEFAULT_API_MODEL = (envDefaultOverride && models.MODEL_REGISTRY.some(m => m.apiModel === envDefaultOverride))
-  ? envDefaultOverride
-  : models.resolveApiModel(models.DEFAULT_DISPLAY_NAME);
+const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY;
 
 app.use(express.json({ limit: '1mb' }));
 app.use(cookieParser());
@@ -65,34 +58,16 @@ function clientIp(req) {
 app.get('/api/health', (req, res) => {
   res.json({
     ok: true,
-    keyConfigured: Boolean(GEMINI_API_KEY),
-    defaultModel: models.DEFAULT_DISPLAY_NAME, // Aura display name, never a raw Gemini model ID
-    models: models.getPublicModelList(),        // [{ displayName, description, isDefault }]
+    keyConfigured: Boolean(GEMINI_API_KEY), // reports Gemini only — MISTRAL_API_KEY's presence is never exposed here or anywhere else client-facing
+    defaultModel: models.DEFAULT_DISPLAY_NAME, // Aura display name, never a raw Gemini/Mistral model ID
+    models: models.getPublicModelList(),        // [{ displayName, description, isDefault }] — no provider names, no raw model IDs
     accountsEnabled: db.isConfigured(),
     googleOAuthEnabled: oauth.isConfigured(),
   });
 });
 
-// Convert the OpenAI-style {role: 'user'|'assistant', content: string} history
-// the frontend already sends into Gemini's {role: 'user'|'model', parts: [{text}]}
-// format. This is the only shape translation needed — the frontend and
-// pipeline.js are untouched, so this conversion happens entirely server-side.
-function toGeminiContents(messages) {
-  return messages.map(m => ({
-    role: m.role === 'assistant' ? 'model' : 'user',
-    parts: [{ text: m.content }],
-  }));
-}
-
 app.post('/api/chat', async (req, res) => {
   try {
-    if (!GEMINI_API_KEY) {
-      return res.status(500).json({
-        error: 'SERVER_NOT_CONFIGURED',
-        message: 'GEMINI_API_KEY is not set on the server. Add it in Railway → Variables.',
-      });
-    }
-
     const ip = req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.socket.remoteAddress || 'unknown';
     if (isRateLimited(ip)) {
       return res.status(429).json({ error: 'RATE_LIMITED', message: 'Too many requests. Slow down a moment.' });
@@ -108,80 +83,118 @@ app.post('/api/chat', async (req, res) => {
     const trimmedMessages = messages.slice(-20);
 
     // `model` here is an Aura display name from the browser (e.g. "Aura 1
-    // Flash"), never a raw Gemini model ID — resolveApiModel is the only
-    // place that turns it into something sent to Google, and it always
-    // falls back to the default for anything not in the registry. This is
-    // the enforcement point that stops arbitrary model IDs from reaching
-    // the Gemini API via a forged request.
+    // Flash"), never a raw provider model ID. resolveModelEntry is the
+    // only place that turns it into a registry entry carrying the real
+    // Gemini/Mistral model IDs and provider strategy — anything not in the
+    // registry (typo, stale cache, forged value) resolves to the default
+    // entry instead of being passed through to any provider.
     const requestedDisplayName = typeof model === 'string' ? model.trim() : '';
-    const displayNameForResponse = models.isKnownDisplayName(requestedDisplayName)
-      ? requestedDisplayName
-      : models.DEFAULT_DISPLAY_NAME;
-    const apiModel = requestedDisplayName
-      ? models.resolveApiModel(requestedDisplayName)
-      : DEFAULT_API_MODEL;
+    const entry = models.resolveModelEntry(requestedDisplayName);
+    const displayNameForResponse = entry.displayName;
 
-    const startedAt = Date.now();
-
-    const geminiRes = await fetch(`${GEMINI_BASE_URL}/${encodeURIComponent(apiModel)}:generateContent`, {
-      method: 'POST',
-      headers: {
-        'x-goog-api-key': GEMINI_API_KEY,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        system_instruction: { parts: [{ text: systemPrompt }] },
-        contents: toGeminiContents(trimmedMessages),
-        // Note: temperature/top_p/top_k are deprecated on Gemini 3.x models
-        // and are intentionally omitted — only maxOutputTokens is set here.
-        generationConfig: {
-          maxOutputTokens: Math.min(maxTokens || 700, 1200),
-        },
-      }),
+    const result = await runChatWithFallback({
+      entry,
+      systemPrompt,
+      messages: trimmedMessages,
+      maxTokens,
     });
 
-    const data = await geminiRes.json();
-    const latencyMs = Date.now() - startedAt;
-
-    if (!geminiRes.ok) {
-      // If the specific model Google rejected was a non-default pick, retry
-      // once against the default rather than surfacing a raw Gemini error
-      // about an internal model ID the user was never shown.
-      if (apiModel !== DEFAULT_API_MODEL && (geminiRes.status === 404 || geminiRes.status === 400)) {
-        const retryRes = await fetch(`${GEMINI_BASE_URL}/${encodeURIComponent(DEFAULT_API_MODEL)}:generateContent`, {
-          method: 'POST',
-          headers: { 'x-goog-api-key': GEMINI_API_KEY, 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            system_instruction: { parts: [{ text: systemPrompt }] },
-            contents: toGeminiContents(trimmedMessages),
-            generationConfig: { maxOutputTokens: Math.min(maxTokens || 700, 1200) },
-          }),
-        });
-        const retryData = await retryRes.json();
-        if (retryRes.ok) {
-          const retryText = retryData?.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('').trim() || '';
-          return res.json({
-            text: retryText,
-            model: models.DEFAULT_DISPLAY_NAME,
-            latencyMs: Date.now() - startedAt,
-            modelFallback: true,
-          });
-        }
-      }
-      return res.status(geminiRes.status).json({
-        error: 'UPSTREAM_ERROR',
-        message: data?.error?.message || 'Gemini request failed.',
-      });
-    }
-
-    const text = data?.candidates?.[0]?.content?.parts?.map(p => p.text || '').join('').trim() || '';
-    res.json({ text, model: displayNameForResponse, latencyMs });
+    res.json({
+      text: result.text,
+      model: displayNameForResponse, // always the Aura display name — never "gemini-3.6-flash" or "mistral-large-latest"
+      latencyMs: result.latencyMs,
+    });
 
   } catch (err) {
+    if (err instanceof providers.ProviderError) {
+      // A provider failure that reached here means either: it wasn't
+      // retryable (e.g. bad API key, malformed request) so no fallback was
+      // attempted, or it WAS retryable but the fallback also failed. Either
+      // way, the user gets a clean, generic message — never the raw
+      // provider error text, which could hint at internal model IDs, key
+      // validity, or account-specific details.
+      console.error(`chat endpoint provider error [${err.provider}]:`, err.message);
+      const status = err.httpStatus && err.httpStatus >= 400 && err.httpStatus < 600 ? err.httpStatus : 502;
+      return res.status(status).json({
+        error: 'UPSTREAM_ERROR',
+        message: 'Aura AI is temporarily unable to respond. Please try again in a moment.',
+      });
+    }
     console.error('chat endpoint error:', err);
     res.status(500).json({ error: 'SERVER_ERROR', message: 'Unexpected server error.' });
   }
 });
+
+// ============================================================
+// CHAT ROUTING: per-model provider strategy (see models.js)
+//
+//   'gemini-with-fallback' — Gemini first; on a retryable
+//       provider-availability failure, fall back to Mistral once.
+//   'mistral-only' — Mistral directly; Gemini is never called.
+//
+// This function is the ONLY place that decides which provider(s) to call
+// for a given request — providers.js just makes the HTTP calls, and
+// models.js just declares the strategy per model.
+// ============================================================
+async function runChatWithFallback({ entry, systemPrompt, messages, maxTokens }) {
+  if (entry.strategy === 'mistral-only') {
+    if (!MISTRAL_API_KEY) {
+      throw new providers.ProviderError('Mistral is not configured on this server.', {
+        httpStatus: 503, provider: 'mistral', providerErrorCode: 'NOT_CONFIGURED',
+      });
+    }
+    return providers.callMistral({
+      apiKey: MISTRAL_API_KEY,
+      mistralModel: entry.mistralModel,
+      systemPrompt, messages, maxTokens,
+    });
+  }
+
+  // strategy === 'gemini-with-fallback'
+  if (!GEMINI_API_KEY) {
+    throw new providers.ProviderError('Gemini is not configured on this server.', {
+      httpStatus: 503, provider: 'gemini', providerErrorCode: 'NOT_CONFIGURED',
+    });
+  }
+
+  try {
+    return await providers.callGemini({
+      apiKey: GEMINI_API_KEY,
+      geminiModel: entry.geminiModel,
+      systemPrompt, messages, maxTokens,
+    });
+  } catch (geminiErr) {
+    if (!(geminiErr instanceof providers.ProviderError)) throw geminiErr;
+
+    const shouldFallback = providers.isRetryableFailure(geminiErr.httpStatus, geminiErr.providerErrorCode);
+    if (!shouldFallback) {
+      // Permanent failure (bad key, malformed request, bad model config,
+      // etc) — surface it directly rather than masking it with a fallback
+      // that would also just fail, or silently produce a response from a
+      // different provider for a problem that needs fixing, not retrying.
+      throw geminiErr;
+    }
+
+    console.warn(`Gemini retryable failure (status ${geminiErr.httpStatus}, code ${geminiErr.providerErrorCode}) — falling back to Mistral.`);
+
+    if (!MISTRAL_API_KEY) {
+      // Gemini failed in a retryable way, but there's no fallback
+      // available — report this as the (retryable) Gemini failure rather
+      // than a confusing "Mistral not configured" message, since from the
+      // user's perspective this model is still "Gemini-backed."
+      throw geminiErr;
+    }
+
+    // Fall back once. If Mistral ALSO fails, that error propagates up as
+    // a clean user-facing error per the ProviderError catch above — no
+    // further retry loop.
+    return providers.callMistral({
+      apiKey: MISTRAL_API_KEY,
+      mistralModel: entry.mistralModel,
+      systemPrompt, messages, maxTokens,
+    });
+  }
+}
 
 // ============================================================
 // AUTH ROUTES

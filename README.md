@@ -22,24 +22,43 @@ simulated send-message interaction through the real `handleSend()` code
 path, and confirming the resulting `localStorage` contents contain no
 trace of the message text.
 
-**2. Aura-branded model names.** The UI never shows a raw Gemini model ID.
-`models.js` maintains the only mapping between user-facing names and real
-API model IDs:
+**2. Aura-branded model names, now backed by two providers.** The UI never
+shows a raw Gemini or Mistral model ID. `models.js` maintains the only
+mapping between user-facing names and real provider model IDs, and also
+declares each model's provider strategy:
 
-| Display name (what users see) | Gemini model ID (server-side only) |
-|---|---|
-| **Aura 1 Flash** (default) | `gemini-3.6-flash` |
-| Aura 1 Flash Lite | `gemini-3.5-flash-lite` |
-| Aura 1 Pro | `gemini-3.1-pro-preview` |
+| Display name (what users see) | Primary provider | Fallback | Notes |
+|---|---|---|---|
+| **Aura 1 Flash** (default) | Gemini (`gemini-3.6-flash`) | Mistral (`mistral-large-latest`) | Falls back only on a genuine retryable provider failure |
+| Aura 1 Flash Lite | Gemini (`gemini-3.5-flash-lite`) | Mistral (`mistral-large-latest`) | Same fallback behavior as Flash |
+| Aura 1 Pro | Mistral (`mistral-large-latest`) | — | Gemini is never called for this model |
 
-The browser only ever sends/receives display names. `/api/chat` resolves
-a display name to a real model ID via a fixed lookup table — anything not
-in that table (a stale cached value, a forged request, a typo) silently
-falls back to the default rather than being passed through to Google.
-This was verified with a direct forgery test: a request with
-`model: "gemini-2.5-flash"` sent straight to `/api/chat` still resolves to
-and returns `"Aura 1 Flash"`, proving arbitrary strings can't reach the
-Gemini API.
+The browser only ever sends/receives display names — never a provider
+name, a raw model ID, or which provider actually served a given response.
+`/api/chat` resolves a display name to a registry entry via a fixed lookup
+table; anything not in that table (a stale cached value, a forged request,
+a typo — including a forged *raw* Gemini or Mistral model ID) silently
+falls back to the default entry rather than being passed through to either
+provider. Verified with direct forgery tests using both a fake Gemini
+model string and a real raw Mistral model string as the `model` field —
+both resolve to the default, neither reaches a provider.
+
+**2a. Automatic Gemini → Mistral fallback.** Aura 1 Flash and Aura 1 Flash
+Lite call Gemini first. If Gemini fails with a genuine
+availability problem — HTTP 429/500/502/503/504, or a
+`RESOURCE_EXHAUSTED`/`UNAVAILABLE`/quota-related error code — the exact
+same request (same system prompt, same conversation history) is retried
+once against Mistral, and the response is returned as if nothing
+happened; the client-facing `model` field still just says "Aura 1 Flash."
+Permanent failures (bad API key, malformed request, invalid model
+configuration) are deliberately **not** retried against Mistral — those
+are real problems that a fallback would either mask or fail identically
+against, so they're surfaced directly as a clean error instead. Aura 1 Pro
+calls Mistral directly and never touches Gemini at all, not even as a
+fallback target for itself. If Mistral fails — whether called directly for
+Pro or as a fallback for Flash/Flash Lite — the user gets a generic,
+clean error message; the raw provider error text is logged server-side
+only and never returned in the API response.
 
 **3. "Continue with Google."** Real, server-side OAuth 2.0 (authorization
 code flow) — not a fake button. See the Google OAuth section below. If
@@ -70,20 +89,29 @@ Browser
   ↓  /api/auth/*  (email/password + Google OAuth, cookie-based sessions)
   ↓  /api/conversations/*  (logged-in users only)
 Railway server (server.js)
-  ↓  models.js resolves "Aura 1 Flash" → gemini-3.6-flash
-  ↓  GEMINI_API_KEY from process.env → Gemini API
+  ↓  models.js resolves "Aura 1 Flash" → { strategy: gemini-with-fallback,
+  ↓      geminiModel: gemini-3.6-flash, mistralModel: mistral-large-latest }
+  ↓  runChatWithFallback() in server.js decides which provider(s) to call
+  ↓  providers.js makes the actual HTTP calls:
+  ↓    GEMINI_API_KEY from process.env → Gemini API (primary for Flash/Flash Lite)
+  ↓    MISTRAL_API_KEY from process.env → Mistral API (primary for Pro,
+  ↓      automatic fallback for Flash/Flash Lite on a retryable Gemini failure)
   ↓  DATABASE_URL from process.env → Postgres (accounts + saved chats)
   ↓  GOOGLE_CLIENT_ID/SECRET from process.env → Google OAuth (oauth.js)
-Response
+Response  { text, model: "Aura 1 Flash", latencyMs }
   ↓
 Browser
 ```
 
-No secret (Gemini key, database credentials, Google client secret, session
-tokens, password hashes) ever reaches `public/index.html`, `public/app.js`,
-or `public/pipeline.js` — grep those files yourself; none of these strings
-appear there, only the *names* of the required environment variables in
-user-facing help text for when something isn't configured.
+No secret (Gemini key, Mistral key, database credentials, Google client
+secret, session tokens, password hashes) ever reaches
+`public/index.html`, `public/app.js`, or `public/pipeline.js` — grep those
+files yourself; none of these strings appear there. `MISTRAL_API_KEY`
+specifically does not appear anywhere client-facing at all — not even as
+a variable *name* in help text (unlike `GEMINI_API_KEY`, which does appear
+as a name in a couple of user-facing "not configured" messages, matching
+its pre-existing behavior) — and it is never included in `/api/health` or
+any `/api/chat` response.
 
 ## Guest mode vs. accounts
 
@@ -155,8 +183,18 @@ identical in form to an email/password login.
   `user_id`. `addMessage` additionally verifies conversation ownership
   before inserting.
 - **Model allowlist:** `/api/chat` never forwards a client-supplied model
-  string directly to Gemini — it's only ever used as a lookup key into
-  `models.js`'s fixed registry.
+  string directly to Gemini or Mistral — it's only ever used as a lookup
+  key into `models.js`'s fixed registry, which resolves it to a
+  provider-strategy entry, not a passthrough value.
+- **Retryable vs. permanent provider failures:** `providers.js`'s
+  `isRetryableFailure()` only treats HTTP 429/500/502/503/504 and
+  `RESOURCE_EXHAUSTED`/`UNAVAILABLE`/quota provider error codes as
+  fallback-eligible. A bad API key, malformed request, or invalid model
+  configuration is surfaced directly — a fallback would either mask a real
+  configuration problem or just fail identically against the other
+  provider. Verified with a dedicated 15-case unit test covering every
+  listed status/code plus several non-retryable cases (401, 400, 403, 404,
+  422, `INVALID_ARGUMENT`).
 - **Rate limiting:** 30 req/min per IP on `/api/chat`, 10 req/min per IP
   on `/api/auth/*`.
 
@@ -164,14 +202,15 @@ identical in form to an email/password login.
 
 ```
 aura-ai/
-├── server.js         # Express app: static frontend, /api/chat (Gemini via models.js), auth + OAuth + conversation routes
-├── models.js          # Aura display name ↔ Gemini model ID registry (the only place this mapping lives)
+├── server.js         # Express app: static frontend, /api/chat routing (see runChatWithFallback), auth + OAuth + conversation routes
+├── models.js          # Aura display name ↔ {provider strategy, Gemini model ID, Mistral model ID} registry (the only place this mapping lives)
+├── providers.js         # Gemini + Mistral HTTP clients and retryable-failure classification — no routing logic, just the calls
 ├── oauth.js            # Google OAuth 2.0 authorization code flow (server-side only)
 ├── db.js                # Postgres access layer — schema (incl. Google OAuth columns) + all queries, scoped by user_id
 ├── auth.js                # Password hashing, session tokens, auth middleware
-├── package.json              # dependencies: express, cookie-parser, bcryptjs, pg (no OAuth library needed — plain fetch)
+├── package.json              # dependencies: express, cookie-parser, bcryptjs, pg (no provider SDK needed — plain fetch for both Gemini and Mistral)
 ├── railway.json                # Railway build/deploy config
-├── .env.example                  # environment variable reference, incl. Google OAuth
+├── .env.example                  # environment variable reference, incl. Mistral + Google OAuth
 ├── .gitignore
 └── public/
     ├── index.html          # UI shell + styles — welcome modal, sidebar account card, settings
@@ -187,9 +226,17 @@ aura-ai/
 3. **Set environment variables** (Variables tab):
    ```
    GEMINI_API_KEY = your-real-gemini-key
+   MISTRAL_API_KEY = your-real-mistral-key
    ```
-   Optional: `AURA_DEFAULT_MODEL`, `NODE_ENV=production`, and the three
-   `GOOGLE_*` variables above for Google sign-in.
+   `GEMINI_API_KEY` powers Aura 1 Flash and Aura 1 Flash Lite as their
+   primary provider. `MISTRAL_API_KEY` powers Aura 1 Pro directly, and
+   also serves as the automatic fallback for Flash/Flash Lite if Gemini
+   has a genuine outage. Either can technically be omitted (the affected
+   model(s) return a clean "not configured" error instead of crashing),
+   but setting both is what actually enables the fallback behavior.
+
+   Optional: `NODE_ENV=production`, and the three `GOOGLE_*` variables
+   above for Google sign-in.
 4. **Deploy.** Railway runs `npm install` then `npm start`. On first boot
    with Postgres attached, the server creates all tables automatically —
    including migration-safe `ALTER TABLE` statements so upgrading an
@@ -198,6 +245,8 @@ aura-ai/
 5. Open the Railway URL — first-time logged-out visitors see the welcome
    modal; Settings → General shows connection status for Gemini, and the
    account area reflects whether Postgres/Google OAuth are configured.
+   (Mistral's configuration status is intentionally not exposed in
+   Settings or `/api/health` — see Security notes.)
 
 ## Local development
 
@@ -206,6 +255,7 @@ npm install
 cp .env.example .env
 # edit .env: GEMINI_API_KEY required; DATABASE_URL and GOOGLE_* optional
 export GEMINI_API_KEY=your-real-gemini-key
+export MISTRAL_API_KEY=your-real-mistral-key
 npm start
 ```
 
@@ -238,10 +288,59 @@ and fixed before trusting its results).
   links to that same account (verified by matching user ID) instead of
   creating a duplicate.
 - **Model registry & forgery protection**: public model list never
-  contains a raw Gemini ID; valid display names resolve correctly; a
-  forged raw model ID (`gemini-2.5-flash`) sent directly to `/api/chat`
-  safely falls back to the default and the response correctly reports
-  `"Aura 1 Flash"`.
+  contains a raw Gemini or Mistral ID, provider name, or strategy field;
+  valid display names resolve correctly; a forged raw Gemini model ID
+  (`gemini-2.5-flash`) AND a forged raw Mistral model ID
+  (`mistral-large-latest`) sent directly as the `model` field both safely
+  fall back to the default and the response correctly reports
+  `"Aura 1 Flash"` in every case.
+- **Multi-provider routing & fallback (12 scenarios from the provider
+  architecture spec, all executed against the real, unmodified
+  `server.js` with fake Gemini/Mistral `fetch` responses)**:
+  1. Aura 1 Flash + Gemini succeeds → Gemini response returned, Mistral
+     never called (call counters confirm 1 Gemini call, 0 Mistral calls).
+  2. Aura 1 Flash + Gemini 429 → Mistral fallback used; response `model`
+     field still reads `"Aura 1 Flash"`, never revealing the fallback.
+  3. Aura 1 Flash + Gemini 503 → Mistral fallback used.
+  4. Aura 1 Flash Lite + Gemini succeeds → Gemini response, no fallback.
+  5. Aura 1 Flash Lite + Gemini quota failure (429/`RESOURCE_EXHAUSTED`)
+     → Mistral fallback used.
+  6. Aura 1 Pro → Mistral called directly; Gemini call counter stays at 0
+     for the entire request.
+  7. Gemini fails retryably (500) *and* the Mistral fallback also fails
+     (500) → a clean generic error is returned; the response body was
+     checked to contain neither the raw Mistral error text nor the word
+     "mistral" in any case.
+  8. `MISTRAL_API_KEY` unset: (a) Aura 1 Pro returns a clean 5xx
+     config error without crashing, and the error body was checked to
+     never contain the literal string `MISTRAL_API_KEY`; (b) Aura 1 Flash
+     with a retryable Gemini failure and no Mistral key configured
+     reports as a Gemini failure rather than crashing or hanging.
+  9. Invalid/expired Gemini key simulated as HTTP 401 → Mistral call
+     counter stays at 0 (confirming non-retryable failures are never
+     silently papered over with a fallback) and a clean error is
+     returned.
+  10. Forged model IDs (both a stale raw Gemini ID and a raw Mistral ID)
+      → existing default-fallback behavior in the model registry,
+      unaffected by the new provider logic.
+  11. Grepped `public/app.js` and `public/index.html`: zero occurrences
+      of `MISTRAL_API_KEY` anywhere (not even as a variable name, unlike
+      `GEMINI_API_KEY` which does appear in pre-existing help text);
+      reviewed every `res.json()` call site in `server.js` and confirmed
+      none references either key variable.
+  12. Full existing regression suite (17 checks: health, signup,
+      duplicate-email rejection, wrong-password rejection, logout/session
+      invalidation, Google OAuth initiate/callback/CSRF-state-rejection,
+      conversation creation, unauthenticated-request blocking, cross-user
+      read/delete isolation, an end-to-end chat call through the new
+      routing path, and both the auth and chat rate limiters under burst)
+      re-run after the provider changes — all still pass.
+
+  Additionally, `providers.js`'s `isRetryableFailure()` was unit-tested
+  directly against all 15 cases named in the spec (429/500/502/503/504,
+  `RESOURCE_EXHAUSTED`, `UNAVAILABLE`, and the non-retryable
+  401/400/403/404/422/`INVALID_ARGUMENT`/no-signal cases) — all 15 pass.
+
 - **Guest-mode persistence**: static audit of every `localStorage` call in
   `app.js` (none touch chat content); a real simulated send-message flow
   driven through the actual `handleSend()` code path against a DOM stub,
@@ -266,6 +365,13 @@ and fixed before trusting its results).
 - **DOM/ID consistency**: every `$('id')` reference in `app.js` (76
   total) cross-checked against `index.html` — zero missing elements;
   zero duplicate `id` attributes anywhere in the page.
+- **Scope discipline**: `diff`-checked `public/pipeline.js`, `public/app.js`,
+  and `public/index.html` against the pre-Mistral version — all three are
+  byte-for-byte identical, confirming the provider architecture change
+  touched only `server.js`, `models.js` (rewritten), and the new
+  `providers.js`, with zero incidental changes to the Aura Engine, Mood
+  Detector, Query Classifier, Cringe Detector, memory, scoring, or any
+  frontend code.
 
 ### Known limitations
 
