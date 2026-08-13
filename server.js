@@ -13,13 +13,18 @@ const auth = require('./auth');
 const models = require('./models');
 const oauth = require('./oauth');
 const providers = require('./providers');
+const attachments = require('./attachments');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const MISTRAL_API_KEY = process.env.MISTRAL_API_KEY;
 
-app.use(express.json({ limit: '1mb' }));
+// Raised from a smaller default to accommodate base64-encoded image/document
+// attachments (up to 3 files, individually capped in attachments.js — this
+// body limit is just an outer safety net against a wildly oversized
+// request, not the real enforcement point).
+app.use(express.json({ limit: '45mb' }));
 app.use(cookieParser());
 app.use(auth.attachUser);
 app.use(express.static(path.join(__dirname, 'public')));
@@ -73,10 +78,25 @@ app.post('/api/chat', async (req, res) => {
       return res.status(429).json({ error: 'RATE_LIMITED', message: 'Too many requests. Slow down a moment.' });
     }
 
-    const { systemPrompt, messages, model, maxTokens } = req.body || {};
+    const { systemPrompt, messages, model, maxTokens, attachments: rawAttachments } = req.body || {};
 
     if (!systemPrompt || !Array.isArray(messages)) {
       return res.status(400).json({ error: 'BAD_REQUEST', message: 'systemPrompt and messages[] are required.' });
+    }
+
+    // Attachments are treated as untrusted input regardless of what the
+    // client claims about them — validateAttachments re-derives the real
+    // MIME type from file bytes, enforces per-file and aggregate size
+    // limits, and enforces the 3-file cap server-side (never trusting the
+    // frontend's own enforcement of that limit).
+    let validatedAttachments = [];
+    try {
+      validatedAttachments = attachments.validateAttachments(rawAttachments);
+    } catch (attachErr) {
+      if (attachErr instanceof attachments.AttachmentError) {
+        return res.status(400).json({ error: attachErr.code, message: attachErr.message });
+      }
+      throw attachErr;
     }
 
     // Cap payload size defensively — this is a chat proxy, not a general passthrough.
@@ -97,6 +117,7 @@ app.post('/api/chat', async (req, res) => {
       systemPrompt,
       messages: trimmedMessages,
       maxTokens,
+      attachments: validatedAttachments,
     });
 
     res.json({
@@ -115,10 +136,10 @@ app.post('/api/chat', async (req, res) => {
       // validity, or account-specific details.
       console.error(`chat endpoint provider error [${err.provider}]:`, err.message);
       const status = err.httpStatus && err.httpStatus >= 400 && err.httpStatus < 600 ? err.httpStatus : 502;
-      return res.status(status).json({
-        error: 'UPSTREAM_ERROR',
-        message: 'Aura AI is temporarily unable to respond. Please try again in a moment.',
-      });
+      const message = err.isMultimodalRequest
+        ? 'Image and document analysis is temporarily unavailable. You can still chat normally, or try again in a moment.'
+        : 'Aura AI is temporarily unable to respond. Please try again in a moment.';
+      return res.status(status).json({ error: 'UPSTREAM_ERROR', message });
     }
     console.error('chat endpoint error:', err);
     res.status(500).json({ error: 'SERVER_ERROR', message: 'Unexpected server error.' });
@@ -126,17 +147,67 @@ app.post('/api/chat', async (req, res) => {
 });
 
 // ============================================================
-// CHAT ROUTING: per-model provider strategy (see models.js)
+// CHAT ROUTING: per-model provider strategy (see models.js), overridden
+// by attachment presence.
 //
-//   'gemini-with-fallback' — Gemini first; on a retryable
-//       provider-availability failure, fall back to Mistral once.
-//   'mistral-only' — Mistral directly; Gemini is never called.
+//   No attachments:
+//     'gemini-with-fallback' — Gemini first; on a retryable
+//         provider-availability failure, fall back to Mistral once.
+//     'mistral-only' — Mistral directly; Gemini is never called.
+//
+//   With attachments (images/documents):
+//     ALWAYS Gemini, regardless of the selected model's normal strategy.
+//     Verified during implementation that Gemini's generateContent
+//     natively accepts inline image/PDF/TXT data, while Mistral's
+//     chat-completions endpoint has no equivalent PDF/TXT document input
+//     at all, and its documented vision-capable model lineup does not
+//     clearly include the mistral-large-latest model this app uses for
+//     text — attaching files to a Mistral call in this app would either
+//     be silently ignored or fail unpredictably. Rather than guess, this
+//     app never sends attachments to Mistral: if Gemini can't serve a
+//     multimodal request, the user gets a clean "temporarily unavailable"
+//     error instead of a broken/degraded response from the wrong provider.
+//     (See providers.js's callMistral for a defense-in-depth guard against
+//     ever accidentally reaching this state.)
 //
 // This function is the ONLY place that decides which provider(s) to call
 // for a given request — providers.js just makes the HTTP calls, and
 // models.js just declares the strategy per model.
 // ============================================================
-async function runChatWithFallback({ entry, systemPrompt, messages, maxTokens }) {
+async function runChatWithFallback({ entry, systemPrompt, messages, maxTokens, attachments: fileAttachments }) {
+  const hasAttachments = Array.isArray(fileAttachments) && fileAttachments.length > 0;
+
+  if (hasAttachments) {
+    if (!GEMINI_API_KEY) {
+      const err = new providers.ProviderError('Gemini is not configured on this server.', {
+        httpStatus: 503, provider: 'gemini', providerErrorCode: 'NOT_CONFIGURED',
+      });
+      err.isMultimodalRequest = true;
+      throw err;
+    }
+    try {
+      return await providers.callGemini({
+        apiKey: GEMINI_API_KEY,
+        geminiModel: entry.geminiModel || models.MODEL_REGISTRY.find(m => m.geminiModel).geminiModel,
+        systemPrompt, messages, maxTokens,
+        attachments: fileAttachments,
+      });
+    } catch (geminiErr) {
+      // Tag the error as multimodal-related (a separate flag, not the
+      // provider's own providerErrorCode field, which is reserved for
+      // Gemini's actual error taxonomy and used elsewhere for retry
+      // classification) so the route handler can show an image/document-
+      // specific message instead of the generic chat failure message.
+      if (geminiErr instanceof providers.ProviderError) {
+        geminiErr.isMultimodalRequest = true;
+      }
+      // No Mistral fallback for multimodal requests — see the routing
+      // comment above for why. The error propagates as-is to the
+      // ProviderError handler in the route above.
+      throw geminiErr;
+    }
+  }
+
   if (entry.strategy === 'mistral-only') {
     if (!MISTRAL_API_KEY) {
       throw new providers.ProviderError('Mistral is not configured on this server.', {

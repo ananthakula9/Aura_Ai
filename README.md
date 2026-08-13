@@ -2,11 +2,31 @@
 
 A general-purpose AI assistant with an internal aura-farming personality
 pipeline (mood detection, query classification, aura engine, cringe
-detection, memory, scoring), a Gemini backend, a professional chat
-interface, and accounts (email/password or Google) with saved conversation
-history — while guest chat remains fully available with zero persistence.
+detection, memory, scoring), a Gemini + Mistral backend with automatic
+fallback, image/document analysis, browser-native text-to-speech, and
+accounts (email/password or Google) with saved conversation history —
+while guest chat remains fully available with zero persistence.
 
 ## What changed in this version
+
+**0. Image/document analysis + text-to-speech.** Users can attach up to 3
+images (PNG/JPG/WEBP) or documents (PDF/TXT) per message via the new
+attachment button next to the composer, with previews, per-file removal,
+and size limits (8MB/image, 15MB/document) enforced both client-side (for
+immediate feedback) and — the real enforcement point — server-side in the
+new `attachments.js`, which verifies every file's actual type from its
+byte signature rather than trusting the client's claimed MIME type or
+filename. DOCX is deliberately not supported: direct verification against
+Gemini's API showed `generateContent` rejects that MIME type, so it's
+rejected up front with an honest message instead of silently failing.
+Multimodal requests always route to Gemini (see the provider notes below
+for why), regardless of which Aura model tier is selected; a clean
+"temporarily unavailable" error is returned if Gemini can't serve the
+request, rather than silently dropping the attachment or guessing at
+Mistral's vision support. Every AI response also gets a Listen button
+using the browser's native Speech Synthesis API — no conversation text is
+ever sent to a third-party TTS service, and speech never starts without
+an explicit click.
 
 **1. Fixed a real guest-persistence bug.** Guest conversations were being
 written to `localStorage` (key `aura_conversations_v1`) and restored on
@@ -205,16 +225,17 @@ aura-ai/
 ├── server.js         # Express app: static frontend, /api/chat routing (see runChatWithFallback), auth + OAuth + conversation routes
 ├── models.js          # Aura display name ↔ {provider strategy, Gemini model ID, Mistral model ID} registry (the only place this mapping lives)
 ├── providers.js         # Gemini + Mistral HTTP clients and retryable-failure classification — no routing logic, just the calls
+├── attachments.js         # Server-side attachment validation — magic-byte type detection, size/count limits (used by server.js's /api/chat)
 ├── oauth.js            # Google OAuth 2.0 authorization code flow (server-side only)
 ├── db.js                # Postgres access layer — schema (incl. Google OAuth columns) + all queries, scoped by user_id
 ├── auth.js                # Password hashing, session tokens, auth middleware
-├── package.json              # dependencies: express, cookie-parser, bcryptjs, pg (no provider SDK needed — plain fetch for both Gemini and Mistral)
+├── package.json              # dependencies: express, cookie-parser, bcryptjs, pg (no provider SDK, no upload middleware — plain fetch + native FileReader/base64)
 ├── railway.json                # Railway build/deploy config
 ├── .env.example                  # environment variable reference, incl. Mistral + Google OAuth
 ├── .gitignore
 └── public/
-    ├── index.html          # UI shell + styles — welcome modal, sidebar account card, settings
-    ├── app.js               # Frontend logic: chat, markdown rendering, settings, auth UI (landing + email form + Google), guest/account conversation handling
+    ├── index.html          # UI shell + styles — welcome modal, sidebar account card, settings, attachment composer
+    ├── app.js               # Frontend logic: chat, markdown rendering, settings, auth UI, attachments (selection/preview/removal), TTS, guest/account conversation handling
     └── pipeline.js            # Aura pipeline — mood detector, engine, cringe detector, memory, scoring (unchanged)
 ```
 

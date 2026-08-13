@@ -33,14 +33,28 @@ function isRetryableFailure(httpStatus, providerErrorCode) {
 
 // Convert the {role: 'user'|'assistant', content} history shape used
 // throughout this app into Gemini's {role: 'user'|'model', parts:[{text}]}.
-function toGeminiContents(messages) {
-  return messages.map(m => ({
+// If `attachments` is provided, it's attached as additional inline_data
+// parts on the LAST message in the array (i.e. the current user turn) —
+// earlier turns in the history never carry attachments, since this app
+// doesn't persist file bytes across turns (see server.js's chat route).
+function toGeminiContents(messages, attachments) {
+  const contents = messages.map(m => ({
     role: m.role === 'assistant' ? 'model' : 'user',
     parts: [{ text: m.content }],
   }));
+
+  if (attachments && attachments.length > 0 && contents.length > 0) {
+    const lastIdx = contents.length - 1;
+    const attachmentParts = attachments.map(a => ({
+      inline_data: { mime_type: a.mimeType, data: a.buffer.toString('base64') },
+    }));
+    contents[lastIdx].parts = [...contents[lastIdx].parts, ...attachmentParts];
+  }
+
+  return contents;
 }
 
-async function callGemini({ apiKey, geminiModel, systemPrompt, messages, maxTokens }) {
+async function callGemini({ apiKey, geminiModel, systemPrompt, messages, maxTokens, attachments }) {
   const startedAt = Date.now();
 
   let res, data;
@@ -53,7 +67,7 @@ async function callGemini({ apiKey, geminiModel, systemPrompt, messages, maxToke
       },
       body: JSON.stringify({
         system_instruction: { parts: [{ text: systemPrompt }] },
-        contents: toGeminiContents(messages),
+        contents: toGeminiContents(messages, attachments),
         // temperature/top_p/top_k are deprecated on Gemini 3.x models and
         // intentionally omitted — only maxOutputTokens is set here.
         generationConfig: { maxOutputTokens: Math.min(maxTokens || 700, 1200) },
@@ -90,12 +104,22 @@ function toMistralMessages(systemPrompt, messages) {
   ];
 }
 
-async function callMistral({ apiKey, mistralModel, systemPrompt, messages, maxTokens }) {
+async function callMistral({ apiKey, mistralModel, systemPrompt, messages, maxTokens, attachments }) {
   const startedAt = Date.now();
 
   if (!apiKey) {
     throw new ProviderError('Mistral is not configured on this server.', {
       httpStatus: 503, provider: 'mistral', providerErrorCode: 'NOT_CONFIGURED',
+    });
+  }
+
+  // Mistral is never used for multimodal requests in this app (see
+  // server.js's routing comment for why) — this is a defense-in-depth
+  // guard so a future routing bug fails loudly and safely here instead of
+  // silently dropping attachments and answering as if they didn't exist.
+  if (attachments && attachments.length > 0) {
+    throw new ProviderError('Mistral does not support file attachments in this app.', {
+      httpStatus: 400, provider: 'mistral', providerErrorCode: 'MULTIMODAL_NOT_SUPPORTED',
     });
   }
 
