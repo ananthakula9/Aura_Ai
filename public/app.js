@@ -66,6 +66,9 @@ const emptyState = $('emptyState');
 const conversation = $('conversation');
 const userInput = $('userInput');
 const sendBtn = $('sendBtn');
+const attachBtn = $('attachBtn');
+const fileInput = $('fileInput');
+const attachmentPreviews = $('attachmentPreviews');
 const meterFill = $('meterFill');
 const meterScore = $('meterScore');
 const statCurrentStyle = $('statCurrentStyle');
@@ -976,27 +979,57 @@ function formatTime(ts) {
 
 function ensureConversationStarted() { if (emptyState.parentElement) emptyState.remove(); }
 
-function addUser(text, persist = true, timestamp = Date.now()) {
+function addUser(text, persist = true, timestamp = Date.now(), attachmentsForDisplay) {
   ensureConversationStarted();
   const div = document.createElement('div');
   div.className = 'msg user';
   div.innerHTML = `<div class="avatar">You</div><div class="bubble-col"><div class="bubble"></div><div class="msg-meta" style="justify-content:flex-end;"><span class="msg-time">${formatTime(timestamp)}</span></div></div>`;
   div.querySelector('.bubble').textContent = text;
+
+  if (attachmentsForDisplay && attachmentsForDisplay.length > 0) {
+    const thumbRow = document.createElement('div');
+    thumbRow.style.cssText = 'display:flex; gap:6px; margin-top:6px; justify-content:flex-end; flex-wrap:wrap;';
+    attachmentsForDisplay.forEach(att => {
+      if (att.category === 'image' && att.previewUrl) {
+        const img = document.createElement('img');
+        img.src = att.previewUrl;
+        img.alt = att.filename;
+        img.style.cssText = 'width:64px; height:64px; border-radius:10px; object-fit:cover; border:1px solid var(--border);';
+        thumbRow.appendChild(img);
+      } else {
+        const chip = document.createElement('div');
+        chip.style.cssText = 'display:flex; align-items:center; gap:5px; background:var(--bg-elevated); border:1px solid var(--border); border-radius:8px; padding:5px 9px; font-size:11px; color:var(--text-dim);';
+        chip.textContent = '📄 ' + att.filename;
+        thumbRow.appendChild(chip);
+      }
+    });
+    div.querySelector('.bubble-col').insertBefore(thumbRow, div.querySelector('.msg-meta'));
+  }
+
   conversationInner.appendChild(div);
   scrollToBottom();
 
   if (persist) {
+    // Attachment bytes themselves are never persisted (server-side or
+    // client-side) beyond the single /api/chat call that used them — only
+    // a lightweight note of what was attached, so conversation history
+    // reads sensibly, without storing the actual file content anywhere.
+    const attachmentNote = attachmentsForDisplay && attachmentsForDisplay.length > 0
+      ? ` [${attachmentsForDisplay.length} file${attachmentsForDisplay.length > 1 ? 's' : ''} attached: ${attachmentsForDisplay.map(a => a.filename).join(', ')}]`
+      : '';
+    const contentToStore = text + attachmentNote;
+
     if (currentUser && activeConvoId) {
       apiFetch(`/api/conversations/${activeConvoId}/messages`, {
         method: 'POST',
-        body: JSON.stringify({ role: 'user', content: text }),
+        body: JSON.stringify({ role: 'user', content: contentToStore }),
       }).then(() => {
         apiFetch('/api/conversations').then(r => r.json()).then(d => renderServerSidebarList(d.conversations || [], activeConvoId));
       }).catch(err => console.error('failed to persist user message:', err));
     } else {
       // Guest: held only in the in-memory guestConversation object for
       // this page's lifetime — never written to any storage API.
-      guestConversation.messages.push({ role: 'user', content: text, timestamp });
+      guestConversation.messages.push({ role: 'user', content: contentToStore, timestamp });
     }
   }
 }
@@ -1035,6 +1068,17 @@ function addAI(text, debugInfo, auraEvent, persist = true, timestamp = Date.now(
     });
   });
   actions.appendChild(copyBtn);
+
+  const ttsBtn = document.createElement('button');
+  ttsBtn.className = 'msg-action-btn tts-btn';
+  ttsBtn.title = ttsSupported ? 'Listen' : 'Text-to-speech not available on this browser';
+  ttsBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 5L6 9H2v6h4l5 4V5z"/><path d="M15.54 8.46a5 5 0 010 7.07"/></svg>';
+  if (!ttsSupported) ttsBtn.disabled = true;
+  // Speech only ever starts from this explicit click — never automatically
+  // when a response arrives, per the requirement that audio must not
+  // play without direct user interaction.
+  ttsBtn.addEventListener('click', () => toggleSpeak(text, ttsBtn));
+  actions.appendChild(ttsBtn);
 
   const regenBtn = document.createElement('button');
   regenBtn.className = 'msg-action-btn';
@@ -1137,9 +1181,197 @@ userInput.addEventListener('input', () => {
 });
 
 // ============================================================
+// ATTACHMENTS (images + documents)
+// pendingAttachments lives only in memory for the duration of composing
+// the current message — nothing here is ever written to localStorage,
+// sessionStorage, or IndexedDB. Once a message sends, the attachment list
+// is cleared; a refresh loses whatever wasn't sent, same as guest chat
+// text. Client-side limits here mirror attachments.js on the server —
+// but the server re-validates everything from scratch and never trusts
+// these checks, since a request could bypass this UI entirely.
+// ============================================================
+const MAX_ATTACHMENTS = 3;
+const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+const MAX_DOCUMENT_BYTES = 15 * 1024 * 1024;
+const ACCEPTED_TYPES = {
+  'image/png': 'image', 'image/jpeg': 'image', 'image/webp': 'image',
+  'application/pdf': 'document', 'text/plain': 'document',
+};
+
+let pendingAttachments = []; // [{ id, filename, mimeType, category, sizeBytes, dataBase64, previewUrl? }]
+
+function showAttachmentToast(message) {
+  const toast = document.createElement('div');
+  toast.className = 'attachment-toast';
+  toast.textContent = message;
+  document.body.appendChild(toast);
+  setTimeout(() => toast.remove(), 2600);
+}
+
+function formatFileSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return Math.round(bytes / 1024) + ' KB';
+  return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      // reader.result is a data: URL — strip the "data:...;base64," prefix
+      const commaIdx = reader.result.indexOf(',');
+      resolve(commaIdx >= 0 ? reader.result.slice(commaIdx + 1) : reader.result);
+    };
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(file);
+  });
+}
+
+attachBtn.addEventListener('click', () => {
+  if (pendingAttachments.length >= MAX_ATTACHMENTS) {
+    showAttachmentToast(`You can attach up to ${MAX_ATTACHMENTS} files per message.`);
+    return;
+  }
+  fileInput.click();
+});
+
+fileInput.addEventListener('change', async () => {
+  const files = Array.from(fileInput.files || []);
+  fileInput.value = ''; // allow re-selecting the same file later
+
+  for (const file of files) {
+    if (pendingAttachments.length >= MAX_ATTACHMENTS) {
+      showAttachmentToast(`Only the first ${MAX_ATTACHMENTS} files were added — that's the limit per message.`);
+      break;
+    }
+
+    const category = ACCEPTED_TYPES[file.type];
+    if (!category) {
+      showAttachmentToast(`"${file.name}" isn't a supported file type.`);
+      continue;
+    }
+    const maxBytes = category === 'image' ? MAX_IMAGE_BYTES : MAX_DOCUMENT_BYTES;
+    if (file.size > maxBytes) {
+      showAttachmentToast(`"${file.name}" is too large (max ${formatFileSize(maxBytes)}).`);
+      continue;
+    }
+
+    try {
+      const dataBase64 = await fileToBase64(file);
+      const id = 'att_' + Date.now() + '_' + Math.random().toString(36).slice(2, 8);
+      const attachment = {
+        id, filename: file.name, mimeType: file.type, category,
+        sizeBytes: file.size, dataBase64,
+        previewUrl: category === 'image' ? URL.createObjectURL(file) : null,
+      };
+      pendingAttachments.push(attachment);
+    } catch (err) {
+      showAttachmentToast(`Couldn't read "${file.name}".`);
+    }
+  }
+
+  renderAttachmentPreviews();
+});
+
+function renderAttachmentPreviews() {
+  attachmentPreviews.innerHTML = '';
+  pendingAttachments.forEach(att => {
+    const chip = document.createElement('div');
+    chip.className = 'attachment-chip' + (att.category === 'image' ? ' image-chip' : '');
+
+    if (att.category === 'image' && att.previewUrl) {
+      const img = document.createElement('img');
+      img.src = att.previewUrl;
+      img.alt = att.filename;
+      chip.appendChild(img);
+    } else {
+      const icon = document.createElement('div');
+      icon.className = 'file-icon';
+      icon.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><path d="M14 2v6h6"/></svg>';
+      chip.appendChild(icon);
+
+      const meta = document.createElement('div');
+      meta.className = 'file-meta';
+      const name = document.createElement('span');
+      name.className = 'file-name';
+      name.textContent = att.filename;
+      const size = document.createElement('span');
+      size.className = 'file-size';
+      size.textContent = formatFileSize(att.sizeBytes);
+      meta.appendChild(name);
+      meta.appendChild(size);
+      chip.appendChild(meta);
+    }
+
+    const removeBtn = document.createElement('button');
+    removeBtn.className = 'remove-btn';
+    removeBtn.title = 'Remove';
+    removeBtn.innerHTML = '✕';
+    removeBtn.addEventListener('click', () => removeAttachment(att.id));
+    chip.appendChild(removeBtn);
+
+    attachmentPreviews.appendChild(chip);
+  });
+
+  attachBtn.disabled = pendingAttachments.length >= MAX_ATTACHMENTS;
+}
+
+function removeAttachment(id) {
+  const att = pendingAttachments.find(a => a.id === id);
+  if (att && att.previewUrl) URL.revokeObjectURL(att.previewUrl);
+  pendingAttachments = pendingAttachments.filter(a => a.id !== id);
+  renderAttachmentPreviews();
+}
+
+function clearPendingAttachments() {
+  pendingAttachments.forEach(a => { if (a.previewUrl) URL.revokeObjectURL(a.previewUrl); });
+  pendingAttachments = [];
+  renderAttachmentPreviews();
+}
+
+// ============================================================
+// TEXT-TO-SPEECH — browser-native Speech Synthesis API only. Nothing
+// here sends conversation text to any third-party service; the audio is
+// generated entirely on-device by the browser/OS.
+// ============================================================
+const ttsSupported = typeof window !== 'undefined' && 'speechSynthesis' in window;
+let currentUtterance = null;
+let currentSpeakingBtn = null;
+
+function stopSpeaking() {
+  if (ttsSupported) window.speechSynthesis.cancel();
+  if (currentSpeakingBtn) currentSpeakingBtn.classList.remove('speaking');
+  currentUtterance = null;
+  currentSpeakingBtn = null;
+}
+
+function toggleSpeak(text, btn) {
+  if (!ttsSupported) {
+    showAttachmentToast('Text-to-speech isn\u2019t available on this browser.');
+    return;
+  }
+  // Clicking the button that's currently speaking stops it (toggle behavior).
+  if (currentSpeakingBtn === btn) {
+    stopSpeaking();
+    return;
+  }
+  // Switching to a different message's speaker button stops the previous one first.
+  stopSpeaking();
+
+  const utterance = new SpeechSynthesisUtterance(text);
+  utterance.onend = () => { if (currentSpeakingBtn === btn) stopSpeaking(); };
+  utterance.onerror = () => { if (currentSpeakingBtn === btn) stopSpeaking(); };
+
+  currentUtterance = utterance;
+  currentSpeakingBtn = btn;
+  btn.classList.add('speaking');
+  window.speechSynthesis.speak(utterance);
+}
+
+// ============================================================
 // BACKEND CALL — talks only to our own /api/chat
 // ============================================================
-async function callChatAPI(systemPrompt, userMessage, historyOverride) {
+async function callChatAPI(systemPrompt, userMessage, historyOverride, attachmentsForRequest) {
   const messages = [
     ...(historyOverride || chatHistory).slice(-10),
     { role: 'user', content: userMessage }
@@ -1148,10 +1380,20 @@ async function callChatAPI(systemPrompt, userMessage, historyOverride) {
   inFlightController = new AbortController();
   const startedAt = performance.now();
 
+  const body = { systemPrompt, messages, model: selectedModel, maxTokens: responseLengthToTokens() };
+  if (attachmentsForRequest && attachmentsForRequest.length > 0) {
+    // Only filename/mimeType/dataBase64 are sent — the server re-derives
+    // the real MIME type from file bytes itself and never trusts this
+    // client-supplied mimeType alone (see attachments.js).
+    body.attachments = attachmentsForRequest.map(a => ({
+      filename: a.filename, mimeType: a.mimeType, dataBase64: a.dataBase64,
+    }));
+  }
+
   const res = await fetch('/api/chat', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ systemPrompt, messages, model: selectedModel, maxTokens: responseLengthToTokens() }),
+    body: JSON.stringify(body),
     signal: inFlightController.signal,
   });
 
@@ -1234,21 +1476,23 @@ Respond naturally, as the character would — not like you're reading a checklis
 // ============================================================
 async function handleSend() {
   const text = userInput.value.trim();
-  if (!text) return;
+  const attachmentsToSend = pendingAttachments.slice(); // snapshot before clearing
+  if (!text && attachmentsToSend.length === 0) return;
 
   memory.advanceTurn();
   memory._lastUserMessage = text;
 
-  addUser(text);
+  addUser(text || '(sent with attachment)', true, Date.now(), attachmentsToSend);
   userInput.value = '';
   userInput.style.height = 'auto';
+  clearPendingAttachments();
   sendBtn.disabled = true;
   addLoading();
 
-  await runInference(text, chatHistory);
+  await runInference(text, chatHistory, attachmentsToSend);
 }
 
-async function runInference(userText, historyForCall) {
+async function runInference(userText, historyForCall, messageAttachments) {
   try {
     const activeMemory = memoryEnabled ? memory : new AuraMemory();
     const moodResult = detectMood(userText, activeMemory);
@@ -1258,7 +1502,7 @@ async function runInference(userText, historyForCall) {
     const systemPrompt = buildSystemPrompt(engineDecision, slangLevel);
     let responseText, meta;
     try {
-      const result = await callChatAPI(systemPrompt, userText, historyForCall);
+      const result = await callChatAPI(systemPrompt, userText, historyForCall, messageAttachments);
       responseText = result.text;
       meta = result;
     } catch (err) {
@@ -1268,9 +1512,9 @@ async function runInference(userText, historyForCall) {
       if (err.message === 'NO_KEY') {
         addErrorCard('Server not configured', "The server isn't configured with a Gemini key yet. Whoever's running this needs to set GEMINI_API_KEY in the environment.", null);
       } else if (err.message === 'RATE_LIMITED') {
-        addErrorCard('Too many requests', 'Give it a moment and try again.', () => runInference(userText, historyForCall));
+        addErrorCard('Too many requests', 'Give it a moment and try again.', () => runInference(userText, historyForCall, messageAttachments));
       } else {
-        addErrorCard('Connection issue', err.message, () => runInference(userText, historyForCall));
+        addErrorCard('Connection issue', err.message, () => runInference(userText, historyForCall, messageAttachments));
       }
       return;
     }
@@ -1283,7 +1527,7 @@ async function runInference(userText, historyForCall) {
         const rewritePrompt = buildSystemPrompt(
           { ...engineDecision, intensity: 0, style: 'concise' }, 0
         ) + "\n\nIMPORTANT: Your previous attempt was too forced/cringe. Rewrite it plainly and helpfully with zero slang and zero attempt at being cool.";
-        const rewritten = await callChatAPI(rewritePrompt, userText, historyForCall);
+        const rewritten = await callChatAPI(rewritePrompt, userText, historyForCall, messageAttachments);
         if (rewritten.text) {
           responseText = rewritten.text;
           meta = rewritten;
