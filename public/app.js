@@ -727,7 +727,7 @@ async function checkServerHealth() {
       statusDotLg.className = 'status-dot-lg ok';
       topStatusDot.className = 'status-dot ok';
     } else {
-      serverStatus.textContent = 'Server running, but GEMINI_API_KEY is not set';
+      serverStatus.textContent = 'Server running, but Aura AI is not fully configured yet';
       statusDotLg.className = 'status-dot-lg bad';
       topStatusDot.className = 'status-dot bad';
     }
@@ -1407,13 +1407,17 @@ async function callChatAPI(systemPrompt, userMessage, historyOverride, attachmen
     throw new Error(data.message || `Server error (${res.status})`);
   }
 
-  return { text: data.text || '', model: data.model, latencyMs: data.latencyMs ?? clientLatency };
+  return { text: data.text || '', model: data.model, latencyMs: data.latencyMs ?? clientLatency, truncated: Boolean(data.truncated) };
 }
 
 function responseLengthToTokens() {
-  if (responseLength === 'concise') return 300;
-  if (responseLength === 'detailed') return 1100;
-  return 700;
+  // Raised alongside the provider-side MAX_OUTPUT_TOKENS ceiling
+  // (providers.js) — the previous values (300/700/1100) were unrelated to
+  // the actual investigation, but were low enough that "detailed" mode in
+  // particular left very little headroom before hitting the old 1200 cap.
+  if (responseLength === 'concise') return 400;
+  if (responseLength === 'detailed') return 3000;
+  return 1200;
 }
 
 // ============================================================
@@ -1510,7 +1514,7 @@ async function runInference(userText, historyForCall, messageAttachments) {
       sendBtn.disabled = false;
       if (err.name === 'AbortError') return; // user pressed Stop
       if (err.message === 'NO_KEY') {
-        addErrorCard('Server not configured', "The server isn't configured with a Gemini key yet. Whoever's running this needs to set GEMINI_API_KEY in the environment.", null);
+        addErrorCard('Server not configured', "Aura AI isn't fully set up on this server yet. Whoever's running this needs to finish the setup — see the README.", null);
       } else if (err.message === 'RATE_LIMITED') {
         addErrorCard('Too many requests', 'Give it a moment and try again.', () => runInference(userText, historyForCall, messageAttachments));
       } else {
@@ -1568,7 +1572,8 @@ async function runInference(userText, historyForCall, messageAttachments) {
         <span>Aura delta</span><span><b>${scoreResult.delta > 0 ? '+' : ''}${scoreResult.delta}</b></span>
         <span>Model</span><span><b>${meta?.model || selectedModel}</b></span>
         <span>Latency</span><span><b>${meta?.latencyMs ?? '—'}ms</b></span>
-        <span>Backend</span><span><b>Gemini</b></span>
+        <span>Truncated</span><span><b>${meta?.truncated ? 'Yes (hit token limit)' : 'No'}</b></span>
+        <span>System</span><span><b>Aura AI</b></span>
       </div>
     ` : null;
     addAI(responseText, debugInfo, scoreResult.event, true, Date.now(), engineDecision.intensity);
