@@ -124,6 +124,7 @@ app.post('/api/chat', async (req, res) => {
       text: result.text,
       model: displayNameForResponse, // always the Aura display name — never "gemini-3.6-flash" or "mistral-large-latest"
       latencyMs: result.latencyMs,
+      truncated: Boolean(result.truncated), // true if the provider hit its output-token limit — see providers.js. Not auto-continued; surfaced for debug visibility only.
     });
 
   } catch (err) {
