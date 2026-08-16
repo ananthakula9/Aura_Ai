@@ -7,6 +7,7 @@ import {
   AuraMemory, detectMood, runAuraEngine, runCringeCheck,
   scoreAndEvent, STYLE_GUIDANCE, slangGuidance
 } from './pipeline.js';
+import { buildQuizCard } from './components.js';
 
 // ============================================================
 // STATE
@@ -1034,7 +1035,7 @@ function addUser(text, persist = true, timestamp = Date.now(), attachmentsForDis
   }
 }
 
-function addAI(text, debugInfo, auraEvent, persist = true, timestamp = Date.now(), auraIntensity = 0) {
+function addAI(text, debugInfo, auraEvent, persist = true, timestamp = Date.now(), auraIntensity = 0, components = []) {
   ensureConversationStarted();
   const div = document.createElement('div');
   div.className = 'msg ai';
@@ -1088,6 +1089,19 @@ function addAI(text, debugInfo, auraEvent, persist = true, timestamp = Date.now(
   actions.appendChild(regenBtn);
 
   meta.appendChild(actions);
+
+  // Structured response components (e.g. quiz cards) render as an
+  // interactive card directly below the message text bubble. Components
+  // are never persisted to conversation history — like attachment bytes,
+  // they only exist for the live message (see addAI's persist block below).
+  if (Array.isArray(components) && components.length > 0) {
+    for (const comp of components) {
+      if (comp && comp.type === 'quiz') {
+        const card = buildQuizCard(comp);
+        if (card) bubble.insertAdjacentElement('afterend', card);
+      }
+    }
+  }
 
   if (eventsEnabled && auraEvent) {
     const tag = document.createElement('div');
@@ -1407,7 +1421,13 @@ async function callChatAPI(systemPrompt, userMessage, historyOverride, attachmen
     throw new Error(data.message || `Server error (${res.status})`);
   }
 
-  return { text: data.text || '', model: data.model, latencyMs: data.latencyMs ?? clientLatency, truncated: Boolean(data.truncated) };
+  return {
+    text: data.text || '',
+    model: data.model,
+    latencyMs: data.latencyMs ?? clientLatency,
+    truncated: Boolean(data.truncated),
+    components: Array.isArray(data.components) ? data.components : [],
+  };
 }
 
 function responseLengthToTokens() {
@@ -1522,7 +1542,10 @@ async function runInference(userText, historyForCall, messageAttachments) {
       }
       return;
     }
-    if (!responseText) responseText = '...';
+    // If the response was ONLY a structured component (e.g. the model
+    // emitted a quiz card with no surrounding text), there's nothing to
+    // show in the text bubble — the card renders on its own.
+    if (!responseText && !(meta.components && meta.components.length > 0)) responseText = '...';
 
     let cringeResult = runCringeCheck(responseText, engineDecision, memory);
 
@@ -1576,7 +1599,7 @@ async function runInference(userText, historyForCall, messageAttachments) {
         <span>System</span><span><b>Aura AI</b></span>
       </div>
     ` : null;
-    addAI(responseText, debugInfo, scoreResult.event, true, Date.now(), engineDecision.intensity);
+    addAI(responseText, debugInfo, scoreResult.event, true, Date.now(), engineDecision.intensity, meta.components || []);
     updateMeter();
 
   } catch (err) {
