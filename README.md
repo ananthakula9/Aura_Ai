@@ -275,6 +275,7 @@ aura-ai/
 ├── oauth.js            # Google OAuth 2.0 authorization code flow (server-side only)
 ├── db.js                # Postgres access layer — schema (incl. Google OAuth columns, research_sessions) + all queries, scoped by user_id
 ├── auth.js                # Password hashing, session tokens, auth middleware
+├── identity.js            # Single source of truth for Aura's identity (Aura AI, created by Aashrith) — required by the server (enforced identity appendix on every /api/chat), served to the browser at /identity.js, exposed via /api/health
 ├── research/              # Deep Research engine (see the Deep Research section below)
 │   ├── engine.js            # Orchestrator: planner/discovery/extraction/verification/analysis/report agents, state machine, budgets, QC, evidence graph, challenge, versioning
 │   ├── agents.js            # V2 multi-agent layer: deterministic Intent Analyzer, agent registry + selection rules, complexity→config

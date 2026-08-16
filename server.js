@@ -16,6 +16,7 @@ const providers = require('./providers');
 const attachments = require('./attachments');
 const components = require('./components');
 const researchRoutes = require('./research/routes');
+const { AURA_IDENTITY, IDENTITY_SYSTEM_PROMPT_APPENDIX } = require('./identity');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -35,6 +36,13 @@ app.use(express.static(path.join(__dirname, 'public')));
 // no second backend. Session ownership is scoped inside research/routes.js
 // (logged-in users by user id, guests by hashed IP — no new identity).
 app.use('/api/research', researchRoutes.createRouter());
+
+// The single identity.js (repo root) is shared by the server (require)
+// and the browser (classic script tag in index.html). Serve that ONE file
+// explicitly so the frontend always reads the same source of truth.
+app.get('/identity.js', (req, res) => {
+  res.sendFile(path.join(__dirname, 'identity.js'));
+});
 
 // Simple in-memory rate limiter (per IP) so a stray loop can't burn the key's quota.
 const rateBuckets = new Map();
@@ -76,6 +84,7 @@ app.get('/api/health', (req, res) => {
     accountsEnabled: db.isConfigured(),
     googleOAuthEnabled: oauth.isConfigured(),
     researchEnabled: Boolean(GEMINI_API_KEY), // Deep Research runs on the same Gemini key (google_search grounding)
+    identity: { name: AURA_IDENTITY.name, creator: AURA_IDENTITY.creator, role: AURA_IDENTITY.role },
   });
 });
 
@@ -120,14 +129,16 @@ app.post('/api/chat', async (req, res) => {
     const entry = models.resolveModelEntry(requestedDisplayName);
     const displayNameForResponse = entry.displayName;
 
-    // The quiz/component instructions are appended server-side (never
-    // client-controlled): they tell the model to emit structured quiz
-    // JSON inside a ```quiz fenced block when the user asks for a quiz,
-    // and to behave exactly as before for every other request. See
-    // components.js for the format and the parser.
+    // The identity and quiz/component instructions are appended
+    // server-side (never client-controlled): the identity appendix makes
+    // every chat answer identity questions as Aura AI created by Aashrith
+    // (see identity.js — the single source of truth), and the quiz
+    // appendix tells the model to emit structured quiz JSON inside a
+    // ```quiz fenced block when the user asks for a quiz (see
+    // components.js for the format and the parser).
     const result = await runChatWithFallback({
       entry,
-      systemPrompt: systemPrompt + components.QUIZ_SYSTEM_PROMPT_APPENDIX,
+      systemPrompt: systemPrompt + IDENTITY_SYSTEM_PROMPT_APPENDIX + components.QUIZ_SYSTEM_PROMPT_APPENDIX,
       messages: trimmedMessages,
       maxTokens,
       attachments: validatedAttachments,

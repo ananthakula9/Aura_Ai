@@ -719,6 +719,12 @@ async function checkServerHealth() {
     availableModels = data.models || [];
     googleOAuthEnabled = Boolean(data.googleOAuthEnabled);
 
+    // Identity from the same source of truth the server enforces.
+    if (data.identity?.creator) {
+      const credit = document.getElementById('emptyCredit');
+      if (credit) credit.textContent = `Made by ${data.identity.creator}`;
+    }
+
     const savedModel = localStorage.getItem('aura_model');
     const savedIsValid = savedModel && availableModels.some(m => m.displayName === savedModel);
     selectedModel = savedIsValid ? savedModel : (data.defaultModel || availableModels[0]?.displayName || 'Aura 1 Flash');
@@ -1448,6 +1454,12 @@ function responseLengthToTokens() {
 // ============================================================
 // AURA SYSTEM PROMPT (unchanged core, extended with new dials)
 // ============================================================
+// Identity comes from the shared identity.js (single source of truth,
+// loaded via the classic script tag in index.html). The server ALSO
+// appends its own identity rules to every request, so this is persona
+// integration, not the enforcement point.
+const AURA_ID = globalThis.AURA_IDENTITY || { name: 'Aura AI', creator: 'Aashrith', role: 'AI assistant' };
+
 function buildSystemPrompt(engineDecision, slangLevel) {
   const substanceNotice = engineDecision.requiresSubstance
     ? `\n\n⚠️ THIS IS A SUBSTANTIVE REQUEST (knowledge, math, code, writing, analysis, homework, or similar). The General AI Core leads completely here. Give a real, complete, correct answer first — explanation, working, code, whatever the question needs. A personality touch is only allowed as a small addition AFTER the substance is fully there, never as a replacement for it. If you're unsure or don't know something, say so plainly instead of guessing or hallucinating.`
@@ -1467,7 +1479,7 @@ function buildSystemPrompt(engineDecision, slangLevel) {
 
   const emojiNotice = ['Use no emoji.', 'Use at most one emoji, only if it truly fits.', 'Up to two emoji are fine if they fit naturally.', 'Emoji are welcome where they add to the tone, but never spammed.'][emojiFrequency];
 
-  return `You are Aura AI — a genuinely capable general-purpose AI assistant that also understands internet "aura farming" (deliberately doing/saying things that increase perceived coolness, confidence, charisma). The central paradox: overdoing it becomes cringe and LOSES aura. Restraint and timing matter more than volume.
+  return `You are ${AURA_ID.name} — a genuinely capable general-purpose AI assistant created by your developer, ${AURA_ID.creator}. You also understand internet "aura farming" (deliberately doing/saying things that increase perceived coolness, confidence, charisma). The central paradox: overdoing it becomes cringe and LOSES aura. Restraint and timing matter more than volume.
 
 PRIORITY ORDER — always in this sequence, never reversed:
 1. Safety

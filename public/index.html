@@ -1950,7 +1950,7 @@ input[type="range"] {
             <div class="suggestion-chip" data-prompt="Give me a workout plan for beginners">Plan a workout</div>
             <div class="suggestion-chip" id="rsSuggestTopics">🔍 Suggest research topics</div>
           </div>
-          <div class="empty-credit">Made by Aashrith</div>
+          <div class="empty-credit" id="emptyCredit">Made by Aashrith</div>
         </div>
       </div>
     </div>
@@ -2217,6 +2217,10 @@ input[type="range"] {
   </div>
 </div>
 
+<!-- Aura identity — the single source of truth (identity.js at repo root)
+     loaded as a classic script so it sets globalThis.AURA_IDENTITY for the
+     app module below. Keep this tag BEFORE app.js. -->
+<script src="./identity.js"></script>
 <script type="module" src="./app.js"></script>
 </body>
 </html>
