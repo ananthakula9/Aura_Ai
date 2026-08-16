@@ -89,6 +89,26 @@ async function ensureSchema() {
   await query(`CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations(user_id, updated_at DESC);`);
   await query(`CREATE INDEX IF NOT EXISTS idx_messages_convo ON messages(conversation_id, created_at ASC);`);
 
+  // Deep Research sessions — one versioned JSONB document per session
+  // (plan, sources, evidence, conflicts, findings, charts, report, QC,
+  // events, stats). Created here so an upgraded deploy picks it up
+  // migration-safely, same as the OAuth columns above.
+  await query(`
+    CREATE TABLE IF NOT EXISTS research_sessions (
+      id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      owner TEXT NOT NULL,
+      query TEXT NOT NULL,
+      mode TEXT NOT NULL DEFAULT 'auto',
+      effective_mode TEXT NOT NULL DEFAULT 'standard',
+      state TEXT NOT NULL DEFAULT 'created',
+      parent_id UUID REFERENCES research_sessions(id) ON DELETE SET NULL,
+      document JSONB NOT NULL DEFAULT '{}',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    );
+  `);
+  await query(`CREATE INDEX IF NOT EXISTS idx_research_owner ON research_sessions(owner, updated_at DESC);`);
+
   // gen_random_uuid() needs pgcrypto on some Postgres images; harmless if already present.
   await query(`CREATE EXTENSION IF NOT EXISTS pgcrypto;`).catch(() => { /* may lack permission on managed DBs; UUIDs still work if extension already enabled */ });
 }
@@ -246,6 +266,11 @@ async function addMessage(userId, convoId, role, content) {
 module.exports = {
   isConfigured,
   ensureSchema,
+  query, // raw parameterized query — used by research/store.js for the
+         // research_sessions table. Was missing from this export list,
+         // which made every research persist fail with "db.query is not a
+         // function" whenever DATABASE_URL was configured (found during
+         // real-API validation; unit tests run DB-less so never saw it).
   createUser, findUserByEmail, findUserById, findUserByGoogleId, findOrCreateGoogleUser, updateUserPassword, deleteUser,
   createSession, findSession, deleteSession, deleteAllSessionsForUser,
   listConversations, createConversation, getConversationWithMessages,

@@ -15,6 +15,7 @@ const oauth = require('./oauth');
 const providers = require('./providers');
 const attachments = require('./attachments');
 const components = require('./components');
+const researchRoutes = require('./research/routes');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -29,6 +30,11 @@ app.use(express.json({ limit: '45mb' }));
 app.use(cookieParser());
 app.use(auth.attachUser);
 app.use(express.static(path.join(__dirname, 'public')));
+
+// Deep Research API — same Express app, same auth/rate-limit conventions;
+// no second backend. Session ownership is scoped inside research/routes.js
+// (logged-in users by user id, guests by hashed IP — no new identity).
+app.use('/api/research', researchRoutes.createRouter());
 
 // Simple in-memory rate limiter (per IP) so a stray loop can't burn the key's quota.
 const rateBuckets = new Map();
@@ -69,6 +75,7 @@ app.get('/api/health', (req, res) => {
     models: models.getPublicModelList(),        // [{ displayName, description, isDefault }] — no provider names, no raw model IDs
     accountsEnabled: db.isConfigured(),
     googleOAuthEnabled: oauth.isConfigured(),
+    researchEnabled: Boolean(GEMINI_API_KEY), // Deep Research runs on the same Gemini key (google_search grounding)
   });
 });
 

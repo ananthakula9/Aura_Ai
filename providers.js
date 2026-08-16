@@ -9,10 +9,24 @@ const GEMINI_BASE_URL = 'https://generativelanguage.googleapis.com/v1beta/models
 const MISTRAL_CHAT_URL = 'https://api.mistral.ai/v1/chat/completions';
 
 // Ceiling applied to both providers' per-request output-token requests.
-// See the detailed comment inside callGemini() for why this was raised
-// from a previous, much smaller value that was the confirmed cause of
-// responses silently cutting off mid-sentence.
-const MAX_OUTPUT_TOKENS = 4096;
+// Raised 4096 → 8192 during real-API validation: Gemini 3.x counts
+// thinking INSIDE maxOutputTokens, and research-phase JSON calls
+// (analysis over 40+ extracted claims, full reports) were truncating at
+// 4096 — producing unparseable JSON and failed reports. Chat requests
+// stay at the client's own (much smaller) budget, so normal chat behavior
+// is unchanged by the higher ceiling.
+const MAX_OUTPUT_TOKENS = 8192;
+
+// Gemini 3.x-only FLOOR. On these models maxOutputTokens is a COMBINED
+// budget for internal thinking + visible output (verified live: a 300-token
+// request spent 284 tokens thinking and truncated the answer to a stub),
+// and thinkingBudget:0 is rejected with INVALID_ARGUMENT. A short chat
+// answer still costs ~300-600 thinking tokens on top of its visible text,
+// so requests below this floor get silently truncated. Raising the budget
+// does NOT make responses longer — it only buys the thinking headroom —
+// so the concise/balanced/detailed response-length dial keeps working.
+// Mistral has no combined budget; the floor is not applied there.
+const GEMINI_MIN_OUTPUT_TOKENS = 2048;
 
 class ProviderError extends Error {
   constructor(message, { httpStatus, providerErrorCode, provider } = {}) {
@@ -94,8 +108,10 @@ async function callGemini({ apiKey, geminiModel, systemPrompt, messages, maxToke
         // 1200 cap, thinking alone (which defaults to a high effort level)
         // could plausibly consume most or all of the budget, leaving little
         // or nothing for the actual visible answer. The new ceiling gives
-        // real headroom for both.
-        generationConfig: { maxOutputTokens: Math.min(maxTokens || 1200, MAX_OUTPUT_TOKENS) },
+        // real headroom for both. The GEMINI_MIN_OUTPUT_TOKENS floor
+        // (verified live against gemini-3.6-flash) protects short requests
+        // — e.g. the chat "concise" dial at 400 tokens — from truncation.
+        generationConfig: { maxOutputTokens: Math.max(Math.min(maxTokens || 1200, MAX_OUTPUT_TOKENS), GEMINI_MIN_OUTPUT_TOKENS) },
       }),
     });
     data = await res.json();

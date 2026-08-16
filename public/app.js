@@ -8,6 +8,7 @@ import {
   scoreAndEvent, STYLE_GUIDANCE, slangGuidance
 } from './pipeline.js';
 import { buildQuizCard } from './components.js';
+import { initResearch, isResearchMode, handleResearchSend, refreshResearchSidebar } from './research.js';
 
 // ============================================================
 // STATE
@@ -157,6 +158,7 @@ function renderGuestSidebar() {
   sidebarList.appendChild(note);
   const btn = document.getElementById('sidebarInlineSignin');
   if (btn) btn.addEventListener('click', () => openAuthModal('login'));
+  refreshResearchSidebar();
 }
 
 function renderGuestConversationInPlace() {
@@ -683,6 +685,9 @@ function renderServerSidebarList(list, activeId) {
     }));
     sidebarList.appendChild(item);
   });
+
+  // Deep Research keeps its own section at the bottom of the sidebar.
+  refreshResearchSidebar();
 }
 
 // ============================================================
@@ -1181,7 +1186,7 @@ function scrollToBottom() { conversation.scrollTop = conversation.scrollHeight; 
 
 document.getElementById('suggestionRow').addEventListener('click', (e) => {
   const chip = e.target.closest('.suggestion-chip');
-  if (!chip) return;
+  if (!chip || chip.id === 'rsSuggestTopics') return; // topics chip has its own handler in research.js
   userInput.value = chip.dataset.prompt;
   handleSend();
 });
@@ -1503,6 +1508,21 @@ async function handleSend() {
   const attachmentsToSend = pendingAttachments.slice(); // snapshot before clearing
   if (!text && attachmentsToSend.length === 0) return;
 
+  // Deep Research mode: the request goes to the research engine instead of
+  // the plain chat pipeline — a plan is built first, then real web
+  // research, then a cited report (see research.js).
+  if (isResearchMode()) {
+    return handleResearchSend(text, attachmentsToSend, {
+      clearComposer: () => {
+        userInput.value = '';
+        userInput.style.height = 'auto';
+        clearPendingAttachments();
+      },
+      showLoading: addLoading,
+      hideLoading: removeLoading,
+    });
+  }
+
   memory.advanceTurn();
   memory._lastUserMessage = text;
 
@@ -1639,5 +1659,34 @@ if (window.visualViewport) {
 // list (logged in) or the local guest conversation list — this replaces
 // the old unconditional localStorage-only init.
 // ============================================================
+
+// Deep Research UI — initialized with explicit deps so research.js never
+// needs a circular import back into this module.
+initResearch({
+  apiFetch,
+  escapeHtml,
+  renderMarkdown,
+  buildQuizCard,
+  conversationInner,
+  ensureConversationStarted,
+  scrollToBottom,
+  addErrorCard,
+  closeSidebar,
+  toast: showAttachmentToast,
+  persistMessage(role, content) {
+    // Research summary messages persist through the SAME storage path as
+    // normal chat messages — server conversations for logged-in users,
+    // in-memory-only for guests.
+    if (currentUser && activeConvoId) {
+      apiFetch(`/api/conversations/${activeConvoId}/messages`, {
+        method: 'POST',
+        body: JSON.stringify({ role, content: content.slice(0, 20000) }),
+      }).catch(err => console.error('failed to persist research message:', err));
+    } else if (role === 'assistant') {
+      guestConversation.messages.push({ role, content, timestamp: Date.now() });
+    }
+  },
+});
+
 checkAuthAndInit();
 

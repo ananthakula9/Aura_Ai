@@ -55,9 +55,10 @@ const strip = src => src
 
 const pipelineSrc = strip(fs.readFileSync('public/pipeline.js', 'utf8'));
 const componentsSrc = strip(fs.readFileSync('public/components.js', 'utf8'));
+const researchSrc = strip(fs.readFileSync('public/research.js', 'utf8'));
 const appSrc = strip(fs.readFileSync('public/app.js', 'utf8'));
-window.eval(pipelineSrc + '\n' + componentsSrc + '\n' + appSrc);
-console.log('app + components loaded');
+window.eval(pipelineSrc + '\n' + componentsSrc + '\n' + researchSrc + '\n' + appSrc);
+console.log('app + components + research loaded');
 
 // A quiz where the user answers 2 of 3 correctly.
 const QUIZ = {

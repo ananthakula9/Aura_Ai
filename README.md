@@ -267,24 +267,175 @@ chat behavior is preserved.
 
 ```
 aura-ai/
-├── server.js         # Express app: static frontend, /api/chat routing (see runChatWithFallback), auth + OAuth + conversation routes
+├── server.js         # Express app: static frontend, /api/chat routing (see runChatWithFallback), auth + OAuth + conversation routes, mounts /api/research
 ├── models.js          # Aura display name ↔ {provider strategy, Gemini model ID, Mistral model ID} registry (the only place this mapping lives)
 ├── components.js       # Structured response components — quiz system-prompt appendix, quiz intent detection, ```quiz JSON parsing/validation, and plain-text quiz → component normalization (provider-agnostic)
 ├── providers.js         # Gemini + Mistral HTTP clients and retryable-failure classification — no routing logic, just the calls
-├── attachments.js         # Server-side attachment validation — magic-byte type detection, size/count limits (used by server.js's /api/chat)
+├── attachments.js         # Server-side attachment validation — magic-byte type detection, size/count limits (used by /api/chat and /api/research)
 ├── oauth.js            # Google OAuth 2.0 authorization code flow (server-side only)
-├── db.js                # Postgres access layer — schema (incl. Google OAuth columns) + all queries, scoped by user_id
+├── db.js                # Postgres access layer — schema (incl. Google OAuth columns, research_sessions) + all queries, scoped by user_id
 ├── auth.js                # Password hashing, session tokens, auth middleware
+├── research/              # Deep Research engine (see the Deep Research section below)
+│   ├── engine.js            # Orchestrator: planner/discovery/extraction/verification/analysis/report agents, state machine, budgets, QC, evidence graph, challenge, versioning
+│   ├── agents.js            # V2 multi-agent layer: deterministic Intent Analyzer, agent registry + selection rules, complexity→config
+│   ├── data.js              # V2 Data Analyst: deterministic CSV parsing, statistics, Tukey outliers, per-period OLS trends, dataset charts
+│   ├── search.js            # Web access: Gemini google_search grounding (provider abstraction), SSRF-guarded page reading, canonical-URL dedup, domain tiering, recency profiles
+│   ├── store.js             # Session store: Postgres (JSONB) when configured, memory otherwise; ownership scoping
+│   └── routes.js            # /api/research/* endpoints: create/plan/start/pause/resume/stop/followup/challenge/refresh, section actions, content generation, SSE events, exports, topics
 ├── package.json              # dependencies: express, cookie-parser, bcryptjs, pg (no provider SDK, no upload middleware — plain fetch + native FileReader/base64)
 ├── railway.json                # Railway build/deploy config
 ├── .env.example                  # environment variable reference, incl. Mistral + Google OAuth
 ├── .gitignore
+├── demo-research-server.js      # Keyless dev server stubbing the research API for UI work (node demo-research-server.js)
 └── public/
-    ├── index.html          # UI shell + styles — welcome modal, sidebar account card, settings, attachment composer
-    ├── app.js               # Frontend logic: chat, markdown rendering, settings, auth UI, attachments (selection/preview/removal), TTS, guest/account conversation handling
+    ├── index.html          # UI shell + styles — welcome modal, sidebar account card, settings, attachment composer, Deep Research UI (composer toggle, drawer, topics)
+    ├── app.js               # Frontend logic: chat, markdown rendering, settings, auth UI, attachments (selection/preview/removal), TTS, guest/account conversation handling, research mode delegation
+    ├── research.js            # Deep Research UI: plan card, live activity (SSE-driven), report (TOC/citations/charts/conflicts/sources), drawer, sidebar section, topic discovery
     ├── components.js         # Frontend component renderers — paginated interactive quiz card (progress, prev/next, submit, score, review, retry)
     └── pipeline.js            # Aura pipeline — mood detector, engine, cringe detector, memory, scoring (unchanged)
 ```
+
+## Deep Research
+
+Aura includes a production **Deep Research** engine: one sentence in, a
+research plan → real web research → verified evidence → charts → a cited
+professional report out, without leaving the chat.
+
+**How a session runs** (all steps emit real `research.*` events over SSE —
+the activity UI is driven exclusively by them, nothing is faked):
+
+```
+create (planner agent decomposes the request → editable plan)
+  → start
+  → per question: google_search grounding → tier-ranked sources →
+    SSRF-guarded page reads → evidence extraction (claims + exact quotes)
+  → gap analysis + refined second-pass searches (Deep/Maximum)
+  → verification: deterministic numeric conflict detection + model
+    cross-check of claims against their quotes
+  → analysis: findings labeled FACT / ANALYSIS / INFERENCE with
+    confidence + chart specs (values must exist in evidence)
+  → report: sectioned, [n] citations tied to real sources
+  → quality control: citation coverage, numeric consistency,
+    completeness — one revision pass if coverage is low
+  → completed | partial (honest limitations when things fail)
+```
+
+**Key properties**
+
+- **Real web research** via Gemini's `google_search` grounding (uses the
+  existing `GEMINI_API_KEY` — no separate search key) plus direct page
+  fetching with redirect re-validation, private-address blocking, size
+  caps and timeouts.
+- **Source quality engine**: Tier 1 (government/academic/official),
+  Tier 2 (established press/research orgs), Tier 3 (everything else);
+  ranking blends tier, query relevance and recency.
+- **Citations that can't lie**: every `[n]` is validated against the
+  session's real source list at normalization time — invalid ones are
+  stripped, findings without a valid citation are dropped. Clicking a
+  citation shows the source card, its evidence quotes, publication info
+  and verification state.
+- **Conflict detection**: same metric, different values, different
+  sources → surfaced as a "Conflicting Evidence" callout that explains
+  the disagreement instead of silently picking a number.
+- **Modes**: Auto (heuristic), Quick, Standard, Deep, Maximum — each with
+  hard budgets (searches, sources, model calls), search dedup, a 30-min
+  page/search cache, and early stopping. Separate rate limits (6
+  sessions / 10 min, 2 concurrent per owner) protect the quota.
+- **Lifecycle controls**: Start / Pause / Resume / Stop are real — the
+  engine checks its control flag between every unit of work. After a
+  stop, "Generate report from collected evidence" synthesizes from what
+  was actually gathered.
+- **Persistence**: sessions persist to Postgres (`research_sessions`,
+  one versioned JSONB document) when a database is configured —
+  resumable across restarts and re-openable from the sidebar's Research
+  section. Without a database they live in server memory (guest
+  philosophy: nothing is persisted client-side).
+- **File + web research**: attachments ride the same validated pipeline
+  as chat attachments and become first-class "Your File" sources whose
+  content is read by the extraction agent.
+- **Follow-up research**: a child session inherits the parent's used
+  sources (no re-reading) and focuses on the follow-up question.
+- **Exports**: Markdown export (headings, citations, tables, timeline,
+  conflicts, limitations, linked sources), Copy report, Print/PDF, SVG
+  chart download, chart data copy/open.
+
+**API** (mounted at `/api/research`, same conventions as the rest of the
+app — see `research/routes.js` for the full list): `POST /` create+plan,
+`PATCH /:id/plan`, `POST /:id/start|pause|resume|stop|followup|
+report-from-partial`, `GET /:id/events` (SSE), `GET /:id/export.md`,
+`POST /topics`. Ownership: logged-in users by user id, guests by hashed
+IP (no persistent guest identity).
+
+**Research UI development without keys**: `node demo-research-server.js`
+serves the real frontend with the research API stubbed (plan → scripted
+SSE events → full report, plus V2 challenge/section/content/refresh
+endpoints), so the UI can be developed and demoed with no Gemini key and
+no web access.
+
+### V2 upgrades (multi-agent research OS)
+
+The engine was upgraded in place — every V1 behavior is preserved and all
+V1 tests still pass — with the intelligence layer rebuilt:
+
+- **Multi-agent orchestration** (`research/agents.js`): a deterministic
+  **Intent Analyzer** classifies every request (complexity
+  simple/moderate/complex/investigative, topic type, recency context) and
+  an **agent registry** selects which specialists run — Primary Source
+  (government/official), Academic, Industry, Evidence, Verification,
+  Contradiction, Data Analyst, Synthesis, Report, Quality, and the
+  user-invoked **Challenge Agent**. Never all agents on every request;
+  the selection is recorded on the session and shown in the UI.
+- **Parallel research**: independent questions run with bounded
+  concurrency (1-3 by complexity) with budget checks and pause/stop
+  checkpoints still exact.
+- **Source diversity**: logical search providers (general / academic /
+  government / news / company) via a provider abstraction over the
+  grounding backend — regulation queries steer to government sources,
+  science queries to scholarly ones, and so on.
+- **Source deduplication**: canonical-URL equivalence (tracking params,
+  protocol, www, trailing slash) + syndicated-title detection; duplicates
+  are counted so independent confirmation stays honest.
+- **Context-aware recency**: current topics reward fresh sources,
+  historical topics reward established ones, scientific topics blend.
+- **Evidence graph**: deterministic SOURCE → EVIDENCE → FINDING links
+  with claim-level states — `strongly_supported` (≥2 independent
+  domains), `supported`, `weak`, `conflicting`, `rejected` — and
+  independent-confirmation counts. The UI traces
+  **Report → Finding → Claims → Evidence → Source** end-to-end.
+- **Adaptive research**: after the first pass, an adaptive planning agent
+  can grow the plan ("an important unanswered question has emerged"),
+  adding tasks that are researched like any other.
+- **Stop intelligence**: marginal-utility tracking stops searching when
+  the last searches add no new evidence and core questions are answered.
+- **Data research mode**: CSV/TSV uploads are validated server-side,
+  parsed and analyzed **deterministically** (`research/data.js`) — column
+  typing, mean/median/quartiles, Tukey outliers, per-period OLS trends,
+  group means — with chart specs built only from computed values.
+- **Challenge mode**: "Challenge My Research" runs an adversarial pass —
+  opposing-evidence searches, assumption tests, and upheld/weakened/
+  overturned verdicts that update finding confidence visibly.
+- **Versioned research**: "Find newer evidence" creates v2/v3… with a
+  deterministic diff (new sources, new/removed findings, confidence
+  changes) rendered in the report.
+- **Research → content**: Quiz (rendered by the existing interactive
+  quiz card), Study notes, Executive summary, Article — all generated
+  from the research's own evidence with citations intact. A structured
+  **JSON export** (`export.json`) exposes findings/evidence/charts for
+  future coding-agent dashboards.
+- **Section tools**: per-section Regenerate and Simplify (real model
+  passes from the same evidence) plus Ask Aura.
+- **Quality dashboard V2**: nine documented metrics (source quality,
+  evidence coverage, citation coverage, diversity, recency, independent
+  confirmation, conflict handling, numeric integrity, completeness) with
+  each formula shown in the UI — no invented percentages.
+- **Workspace UI**: the activity drawer gained tabs —
+  **Activity | Sources | Evidence | Conflicts | Quality** — with a
+  persisted event timeline, star-rated source cards, claim-state lists,
+  and the quality breakdown; the report shows a visual **research map**
+  (questions → sources → findings) and version diffs.
+- **Observability**: structured per-session phase logging (complexity,
+  agent runs, findings/charts counts) with no user content in logs.
+
 
 ## Deploy to Railway
 
@@ -480,3 +631,78 @@ and fixed before trusting its results).
 - Password reset via email is out of scope (no email provider wired up).
   A signed-in user can change their password directly, which rotates all
   existing sessions for that account.
+
+## Deep Research testing
+
+Four suites cover the research feature (all executed here, all green,
+alongside the quiz suites above):
+
+- **`node test-research.js`** (32 checks) — V1 unit level (tiering,
+  numeric conflict detection, citation normalization, markdown export,
+  HTML→text) + V2 unit level (intent analyzer, agent selection rules,
+  canonical-URL dedup, evidence-graph claim states and finding→claim
+  links, dataset statistics/outliers/trends with quoted-CSV parsing,
+  version diffs, documented quality metrics) + engine state-machine tests
+  (pause at a real checkpoint → PAUSED → resume → COMPLETED; stop →
+  CANCELLED with evidence preserved → report-from-partial) + full-HTTP
+  integration: create → plan edit → SSE → completed report with citation
+  integrity, truthful stats, chart/evidence numeric consistency,
+  conflicts, QC, follow-up inheritance, honest partial failure, topics —
+  and V2 integration: adversarial challenge (verdicts + report section),
+  section regenerate (body changes, invalid action 400), content
+  generation (valid quiz component + cited notes, unknown kind 400),
+  export.json structure, refresh → v2 with deterministic diff, and
+  adaptive planning growing the plan mid-run — plus regression tests for
+  every bug found during real-API validation (below).
+- **`node test-research-frontend.js`** (jsdom, real `index.html` +
+  `research.js`) — composer toggle, plan card, SSE-driven activity,
+  report rendering (TOC, citations, findings, chart, conflicts, sources,
+  QC), citation popover, follow-up — plus V2 UI: drawer tabs (Sources
+  with stars, Evidence with claim states, Conflicts, Quality with
+  documented formulas), version badge + diff, challenge section +
+  verdicts, research map, traceability modal, section tools, and the
+  refresh/content/export actions.
+- **`node live-research-check.js`** — REAL-API integration: boots the
+  real server with the real keys (from `.env`, never printed) and drives
+  real chat (Gemini + Mistral + forged-model fallback), a full standard
+  research run with real search/page-reading/evidence (asserting citation
+  integrity on live sources), citation chains, live SSRF guards, SSE
+  disconnect+reconnect replay, pause→resume and stop→partial under real
+  conditions, challenge, section regeneration, follow-up, refresh→v2
+  diff, and both exports.
+- **`node demo-research-server.js`** — not a test, but a keyless dev
+  server (real frontend, stubbed research API with scripted SSE events,
+  a full report, and V2 challenge/section/content/refresh endpoints)
+  used to verify the whole UI flow over real HTTP during development.
+
+### Bugs found and fixed during real-API validation
+
+Every fix has a regression test in `test-research.js`:
+
+1. **`db.query` was not exported** — with `DATABASE_URL` actually
+   configured, every research persist failed with "db.query is not a
+   function" and silently degraded to memory. Unit tests run DB-less and
+   never saw it.
+2. **Gemini 3.x thinking truncation** — `maxOutputTokens` is a combined
+   thinking+output budget on these models (a live 300-token request
+   spent 284 tokens thinking and truncated the answer to a stub, and
+   `thinkingBudget: 0` is rejected). Fixed with a Gemini-side
+   `GEMINI_MIN_OUTPUT_TOKENS` floor (2048), an 8192 ceiling, and
+   research-scale budgets (6000–8000) for analysis/report/extraction —
+   which also fixed real failed reports where analysis JSON truncated.
+3. **Grounding quota is tier-gated** — the configured key generates fine
+   but hard-429s every `google_search` grounding call. Added a keyless
+   DuckDuckGo HTML fallback provider (unwraps `uddg` redirects, strips
+   result snippets, polite pacing + exponential backoff on DDG's 202
+   anomaly pages), tagged honestly as `provider: 'ddg-html'`.
+4. **Quota-window crash** — when both providers 429 in the same minute
+   (the free tier allows ~20 requests/min/model), research phases failed
+   instantly. `callModelJson` now does a bounded backoff retry (15s,
+   then 30s) with `research.provider_backoff` events.
+5. **False "completed"** — a fully search-throttled run labeled itself
+   completed; failed searches now also mark the run `partial`.
+6. **Truncated-to-empty model responses** — Gemini 3.x can spend the
+   entire combined budget on thinking and return 200 with no visible
+   text (reproduced on section revisions with large bodies). JSON calls
+   now retry once with a doubled budget when the response was truncated
+   and unparseable.

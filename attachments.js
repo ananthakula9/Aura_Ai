@@ -32,6 +32,10 @@ const SUPPORTED_TYPES = {
   'image/webp': { category: 'image', extensions: ['.webp'] },
   'application/pdf': { category: 'document', extensions: ['.pdf'] },
   'text/plain': { category: 'document', extensions: ['.txt'] },
+  // CSV/TSV are plain text (no magic bytes) — detected by structure: a
+  // header line with consistent delimiter counts. Served to the model as
+  // text; parsed deterministically by the research Data Analyst Agent.
+  'text/csv': { category: 'document', extensions: ['.csv', '.tsv'] },
 };
 
 // Magic-byte signatures for the types above. This is the actual security
@@ -122,12 +126,32 @@ function validateAttachment(raw) {
   }
 
   // Never trust the client-provided MIME type alone — verify by content.
-  const realType = detectRealType(buffer);
+  let realType = detectRealType(buffer);
   if (!realType || !SUPPORTED_TYPES[realType]) {
     throw new AttachmentError(
-      `"${filename || 'file'}" isn't a supported file type. Aura AI currently supports PNG, JPG, WEBP, PDF, and TXT files.`,
+      `"${filename || 'file'}" isn't a supported file type. Aura AI currently supports PNG, JPG, WEBP, PDF, TXT, and CSV files.`,
       'UNSUPPORTED_TYPE'
     );
+  }
+
+  // CSV/TSV: plain text with no magic bytes, so the filename extension is
+  // the distinguishing signal — a structurally tabular .csv/.tsv becomes
+  // text/csv (category document); anything else stays text/plain. The
+  // research Data Analyst Agent picks datasets up by this classification.
+  if (realType === 'text/plain' && /\.(csv|tsv)$/i.test(filename || '')) {
+    const sample = buffer.subarray(0, 4096).toString('utf8');
+    const lines = sample.split(/\r?\n/).filter(l => l.trim()).slice(0, 4);
+    const structural = lines.length >= 2 && [',', ';', '\t'].some(delim => {
+      const counts = lines.map(l => l.split(delim).length - 1);
+      return counts.every(c => c === counts[0] && c >= 1);
+    });
+    if (structural) realType = 'text/csv';
+    else {
+      throw new AttachmentError(
+        `"${filename || 'file'}" doesn't look like a valid CSV/TSV table.`,
+        'TYPE_MISMATCH'
+      );
+    }
   }
 
   const spec = SUPPORTED_TYPES[realType];
