@@ -14,6 +14,7 @@ const models = require('./models');
 const oauth = require('./oauth');
 const providers = require('./providers');
 const attachments = require('./attachments');
+const components = require('./components');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -112,19 +113,35 @@ app.post('/api/chat', async (req, res) => {
     const entry = models.resolveModelEntry(requestedDisplayName);
     const displayNameForResponse = entry.displayName;
 
+    // The quiz/component instructions are appended server-side (never
+    // client-controlled): they tell the model to emit structured quiz
+    // JSON inside a ```quiz fenced block when the user asks for a quiz,
+    // and to behave exactly as before for every other request. See
+    // components.js for the format and the parser.
     const result = await runChatWithFallback({
       entry,
-      systemPrompt,
+      systemPrompt: systemPrompt + components.QUIZ_SYSTEM_PROMPT_APPENDIX,
       messages: trimmedMessages,
       maxTokens,
       attachments: validatedAttachments,
     });
 
+    // Extract any structured components (quiz) from the raw provider
+    // text. First the structured path (```quiz fences / bare JSON), then —
+    // only if nothing was found AND the user's last message clearly asked
+    // for an interactive quiz/test — a safe plain-text → component
+    // normalization fallback (see components.js). components is always an
+    // array — empty when the model produced none, so plain chat responses
+    // are byte-for-byte unchanged in shape apart from this new field.
+    const lastUserMessage = [...trimmedMessages].reverse().find(m => m && m.role === 'user')?.content || '';
+    const parsed = components.extractComponents(result.text, lastUserMessage);
+
     res.json({
-      text: result.text,
+      text: parsed.text,
       model: displayNameForResponse, // always the Aura display name — never "gemini-3.6-flash" or "mistral-large-latest"
       latencyMs: result.latencyMs,
       truncated: Boolean(result.truncated), // true if the provider hit its output-token limit — see providers.js. Not auto-continued; surfaced for debug visibility only.
+      components: parsed.components, // [{ type: 'quiz', title, questions }] — [] when the model produced no structured components
     });
 
   } catch (err) {
@@ -552,10 +569,17 @@ async function start() {
     console.log('DATABASE_URL not set — running in guest-only mode (no accounts, no saved history).');
   }
 
-  app.listen(PORT, () => {
+  const httpServer = app.listen(PORT, () => {
     console.log(`Aura AI server running on port ${PORT}`);
     console.log(`Gemini key configured: ${Boolean(GEMINI_API_KEY)}`);
   });
+  // Exposed for tests so a harness can close the listener cleanly (same
+  // pattern as `module.exports = app` below — this file is run directly
+  // by `npm start`, never required in production). Note: this must be
+  // attached to the app object, not module.exports, because the
+  // `module.exports = app` at the bottom of the file replaces the whole
+  // exports object after this function runs.
+  app.httpServer = httpServer;
 }
 
 start();
