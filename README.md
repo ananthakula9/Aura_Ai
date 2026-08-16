@@ -96,10 +96,42 @@ pick "Continue as Guest" aren't re-prompted on every reload; a single
 anonymous flag (`aura_welcome_seen`, no chat data, no token, no personal
 information) tracks that this browser has already seen it.
 
-**5. Sidebar account area.** Bottom of the sidebar now shows a proper
-account card — "Sign in / Save your chats" when logged out, or the user's
-email under an "Account" label when logged in, opening the same account
-menu (Log out, Delete account) as the top-bar avatar.
+**6. Structured quiz components (with plain-text fallback).** When the
+user asks for a quiz — naturally, e.g. "Create a 5-question quiz about
+space," "Quiz me on photosynthesis," "Make a math quiz," "Test me on
+World War 2" — the response now includes an interactive quiz component
+rendered in the chat UI. Server-side, `components.js` appends a short
+format spec to the system prompt telling the model to emit the entire
+quiz as one JSON object inside a ```quiz fenced block. But models
+frequently ignore that and write a perfectly good multiple-choice quiz
+as plain text — so `components.js` has TWO ways to produce a component:
+
+  1. **Structured path:** ```quiz fenced blocks (or a bare JSON quiz
+     object) are parsed, validated (malformed questions dropped, never
+     crashing), and stripped out of the visible text.
+  2. **Intent + normalization fallback:** if no structured component was
+     found AND the user's last message clearly asks for an interactive
+     quiz/test (`isQuizRequest`: quiz/trivia/MCQ/multiple choice/
+     "test me on" etc.), `parsePlainTextQuiz` converts an obvious
+     plain-text quiz (numbered questions with a/b/c/d options — as
+     lines, inline letters, or inline parentheses — plus an Answers/
+     Answer Key block, letter or text answers, or per-question
+     "Answer:" lines) into the exact same component schema.
+
+The fallback is deliberately double-gated (clear quiz intent +
+extractable quiz structure), so normal chat is never touched: a numbered
+list like "5 tips to improve sleep" or a prose answer to a quiz request
+stays plain text. The `/api/chat` response gains a `components` array —
+`[{ type: "quiz", title, questions }]` — empty (`[]`) for every ordinary
+response, so plain chat is byte-for-byte unchanged apart from the new
+field. The frontend (`public/components.js`) renders each quiz component
+as a paginated interactive card: one question at a time with Back/Next,
+a progress bar ("Question 2 of 5"), answer selection, Submit (enabled
+once all questions are answered), a score, per-question review with
+correct/wrong highlighting and explanations, and Retry. Works identically
+whether Gemini or Mistral served the request (it's text-in/text-out on
+both), and components are never persisted to conversation history — they
+live only for the message on screen, like attachment previews.
 
 ## Architecture
 
@@ -118,7 +150,8 @@ Railway server (server.js)
   ↓      automatic fallback for Flash/Flash Lite on a retryable Gemini failure)
   ↓  DATABASE_URL from process.env → Postgres (accounts + saved chats)
   ↓  GOOGLE_CLIENT_ID/SECRET from process.env → Google OAuth (oauth.js)
-Response  { text, model: "Aura 1 Flash", latencyMs }
+Response  { text, model: "Aura 1 Flash", latencyMs, truncated,
+            components: [{ type: "quiz", title, questions }] }
   ↓
 Browser
 ```
@@ -206,6 +239,18 @@ identical in form to an email/password login.
   string directly to Gemini or Mistral — it's only ever used as a lookup
   key into `models.js`'s fixed registry, which resolves it to a
   provider-strategy entry, not a passthrough value.
+- **Quiz parsing is output-side only:** the quiz format spec is appended
+to the system prompt server-side (never client-controlled), and the
+parser only reads the provider's final text — it never feeds model
+output back into a request. Model-provided quiz content is validated
+against a strict shape and escaped before rendering, like any other AI
+output.
+- **Plain-text quiz normalization is double-gated:** conversion only
+happens when the user's last message clearly asks for an interactive
+quiz/test AND the response contains extractable multiple-choice
+structure (numbered questions + ≥2 options + a resolvable answer). A
+numbered list, essay, or prose answer is never converted, so normal
+chat behavior is preserved.
 - **Retryable vs. permanent provider failures:** `providers.js`'s
   `isRetryableFailure()` only treats HTTP 429/500/502/503/504 and
   `RESOURCE_EXHAUSTED`/`UNAVAILABLE`/quota provider error codes as
@@ -224,6 +269,7 @@ identical in form to an email/password login.
 aura-ai/
 ├── server.js         # Express app: static frontend, /api/chat routing (see runChatWithFallback), auth + OAuth + conversation routes
 ├── models.js          # Aura display name ↔ {provider strategy, Gemini model ID, Mistral model ID} registry (the only place this mapping lives)
+├── components.js       # Structured response components — quiz system-prompt appendix, quiz intent detection, ```quiz JSON parsing/validation, and plain-text quiz → component normalization (provider-agnostic)
 ├── providers.js         # Gemini + Mistral HTTP clients and retryable-failure classification — no routing logic, just the calls
 ├── attachments.js         # Server-side attachment validation — magic-byte type detection, size/count limits (used by server.js's /api/chat)
 ├── oauth.js            # Google OAuth 2.0 authorization code flow (server-side only)
@@ -236,6 +282,7 @@ aura-ai/
 └── public/
     ├── index.html          # UI shell + styles — welcome modal, sidebar account card, settings, attachment composer
     ├── app.js               # Frontend logic: chat, markdown rendering, settings, auth UI, attachments (selection/preview/removal), TTS, guest/account conversation handling
+    ├── components.js         # Frontend component renderers — paginated interactive quiz card (progress, prev/next, submit, score, review, retry)
     └── pipeline.js            # Aura pipeline — mood detector, engine, cringe detector, memory, scoring (unchanged)
 ```
 
@@ -393,6 +440,30 @@ and fixed before trusting its results).
   `providers.js`, with zero incidental changes to the Aura Engine, Mood
   Detector, Query Classifier, Cringe Detector, memory, scoring, or any
   frontend code.
+- **Quiz components end-to-end** (`test-quiz.js`): a real HTTP POST to the
+  real `/api/chat` route (real express app, only the provider `fetch`
+  stubbed) with the exact prompt "Create a 5-question quiz about space."
+  — asserts the actual response contains `components[0].type === "quiz"`.
+  Regression coverage includes: the structured ```quiz fence path (5
+  validated questions, JSON stripped from `text`, format spec confirmed
+  in the provider's system prompt); the plain-text normalization fallback
+  for the exact space prompt, "Quiz me on photosynthesis," and "Make a
+  math quiz" (different option layouts — option lines, inline
+  parentheses, inline letters with single-digit answers — all converted
+  to the same schema with answers resolved); non-quiz requests ("Give me
+  5 tips to improve sleep") with numbered-list responses → `components:
+  []` and text untouched (no false positives); quiz intent with a prose
+  response → never converted; a bare-JSON quiz with no fence still
+  parses; malformed quiz JSON degrades to no component without crashing;
+  and the response keeps the standard `{ text, model, latencyMs,
+  truncated, components }` shape. **Frontend** (`test-frontend.js`,
+  jsdom): the real `app.js` + `public/components.js` load and run against
+  a real DOM, and the full paginated quiz interactivity is exercised —
+  one question at a time, progress label/bar, Back/Next, submit gated
+  until all questions are answered, score, review with per-question
+  correct/wrong marks and explanations, Retry, `addAI()` placing the card
+  directly below the message text bubble, empty components being a no-op,
+  and model-provided text escaping (no HTML injection).
 
 ### Known limitations
 
