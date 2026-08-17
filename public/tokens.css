@@ -1,0 +1,49 @@
+/* Aura AI — tokens.css (single source of truth for the design system)
+   Loaded BEFORE redesign.css and AFTER the legacy inline styles' own
+   :root block; original variable names are preserved so all existing
+   styles keep working — this file EXTENDS them with the spacing scale,
+   type scale, motion durations, component radii and focus ring the
+   redesign layer consumes. No component below hardcodes raw values. */
+
+:root {
+  /* Brand — preserved from the original Aura identity (violet → cyan),
+     not a generic AI gradient. */
+  --aura-1: #8b5cf6;
+  --aura-2: #38bdf8;
+  --aura-grad: linear-gradient(135deg, var(--aura-1), var(--aura-2));
+
+  /* Spacing scale — strict 4px base (4, 8, 12, 16, 24, 32, 48, 64) */
+  --sp-1: 4px;  --sp-2: 8px;  --sp-3: 12px; --sp-4: 16px;
+  --sp-5: 20px; --sp-6: 24px; --sp-8: 32px; --sp-10: 40px; --sp-12: 48px; --sp-16: 64px;
+
+  /* Type scale (ui font only; mono reserved for code/data) */
+  --font-ui: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Helvetica, Arial, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "Cascadia Code", Consolas, monospace;
+  --text-xs: 11px; --text-sm: 12.5px; --text-base: 14px;
+  --text-md: 15.5px; --text-lg: 18px; --text-xl: 24px; --text-hero: 30px;
+
+  /* Component radii */
+  --radius-button: 10px;
+  --radius-input: 14px;
+  --radius-card: 16px;
+  --radius-dialog: 20px;
+  --radius-composer: 22px;
+
+  /* Motion — subtle and fast only */
+  --motion-fast: 120ms;
+  --motion-base: 180ms;
+  --motion-slow: 280ms;
+  --ease: cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* Focus ring (accessibility — one ring everywhere) */
+  --focus-ring: 0 0 0 2px var(--bg), 0 0 0 4px color-mix(in srgb, var(--aura-1) 65%, transparent);
+
+  /* Depth — used sparingly: composer, palette, drawers, popovers only */
+  --shadow-composer: 0 8px 32px rgba(0, 0, 0, 0.22), 0 1px 3px rgba(0, 0, 0, 0.18);
+  --shadow-pop: 0 12px 40px rgba(0, 0, 0, 0.30);
+}
+
+:root[data-theme="light"] {
+  --shadow-composer: 0 8px 32px rgba(20, 20, 30, 0.10), 0 1px 3px rgba(20, 20, 30, 0.08);
+  --shadow-pop: 0 12px 40px rgba(20, 20, 30, 0.14);
+}
