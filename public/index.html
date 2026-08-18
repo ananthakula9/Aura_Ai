@@ -1849,6 +1849,8 @@ input[type="range"] {
 .rs-artifact-modal-body { max-height: 60vh; overflow-y: auto; font-size: 13px; line-height: 1.6; }
 .rs-artifact-modal-body p { margin: 0 0 10px; }
 </style>
+<link rel="stylesheet" href="./tokens.css">
+<link rel="stylesheet" href="./redesign.css">
 </head>
 <body>
 <div class="app" id="app">
@@ -2221,6 +2223,7 @@ input[type="range"] {
      loaded as a classic script so it sets globalThis.AURA_IDENTITY for the
      app module below. Keep this tag BEFORE app.js. -->
 <script src="./identity.js"></script>
+<script src="./palette.js"></script>
 <script type="module" src="./app.js"></script>
 </body>
 </html>
